@@ -1,0 +1,529 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
+import type { QueryClient } from '@tanstack/vue-query'
+import { useToast } from 'primevue/usetoast'
+import { onScopeDispose } from 'vue'
+import * as MetadataApi from '@/lib/api/Metadata'
+import { pollReindex } from '@/composables/useReindexPolling'
+import { apiErrorMessage, isCanceledError } from '@/lib/apiError'
+import type {
+    Folder,
+    IdentifyAlbumRequest,
+    IdentifyRequest,
+    MetadataCapabilities,
+    PatchFields,
+    PictureSlot,
+    ReindexRef,
+    Track,
+    UpdateResult,
+    UpdateTracksRequest
+} from '@/types/metadata'
+
+// Query keys
+export const metadataQueryKeys = {
+    folders: (scanFolder: string, path: string) =>
+        ['metadata', 'folders', scanFolder, path] as const,
+    tracks: (scanFolder: string, path: string) => ['metadata', 'tracks', scanFolder, path] as const
+}
+
+// invalidateAfterMetadataWrite drops every cache a tag or picture write can
+// stale. The music UI is keyed by DB ids, and editing an album name, album
+// artist or release MBID moves the tracks to a *new* album row — the editor
+// works in file paths and cannot know which ids changed, so there is no precise
+// key set to target. Same precedent as the library mutations. Call it only
+// after the write's re-index job has been polled to a terminal status (see
+// pollReindex, which every write mutation awaits before resolving) — a
+// resolved write means the DB has caught up as far as this save will make it.
+export function invalidateAfterMetadataWrite(qc: QueryClient) {
+    qc.invalidateQueries({ queryKey: ['metadata', 'tracks'] })
+    qc.invalidateQueries({ queryKey: ['metadata', 'raw'] })
+    qc.invalidateQueries({ queryKey: ['subsonic'] })
+}
+
+export function useFolders(scanFolder: () => string | null, path: () => string) {
+    return useQuery<Folder[]>({
+        queryKey: ['metadata', 'folders', scanFolder, path],
+        queryFn: () => MetadataApi.listFolders(scanFolder() as string, path()),
+        enabled: () => scanFolder() !== null,
+        staleTime: 15_000
+    })
+}
+
+export function useTracks(scanFolder: () => string | null, path: () => string | null) {
+    return useQuery<Track[]>({
+        queryKey: ['metadata', 'tracks', scanFolder, path],
+        queryFn: () => MetadataApi.listTracks(scanFolder() as string, path() as string),
+        enabled: () => scanFolder() !== null && path() !== null,
+        staleTime: 15_000
+    })
+}
+
+// The server refuses a single request that both renames artists and sets their
+// MusicBrainz IDs, because the name-keyed MB-ID map would misalign against the
+// new names. When a patch carries both, split it: write the names first, then
+// (only if that wrote anything) write the MB-IDs keyed by the new names.
+// partitionFields returns null when no split is needed.
+export function partitionFields(
+    fields: PatchFields
+): { names: PatchFields; mbids: PatchFields } | null {
+    const conflict =
+        (fields.artists !== undefined && fields.artist_mbids !== undefined) ||
+        (fields.album_artists !== undefined && fields.album_artist_mbids !== undefined)
+    if (!conflict) return null
+    const { artist_mbids, album_artist_mbids, ...names } = fields
+    const mbids: PatchFields = {}
+    if (artist_mbids !== undefined) mbids.artist_mbids = artist_mbids
+    if (album_artist_mbids !== undefined) mbids.album_artist_mbids = album_artist_mbids
+    return { names, mbids }
+}
+
+// mergeUpdateResults folds the per-path results of the two sequential writes
+// into one list: a path is ok only if every step that ran succeeded, and error
+// messages are concatenated.
+export function mergeUpdateResults(a: UpdateResult[], b: UpdateResult[]): UpdateResult[] {
+    const byPath = new Map<string, UpdateResult>()
+    for (const r of a) byPath.set(r.path, { ...r })
+    for (const r of b) {
+        const prev = byPath.get(r.path)
+        if (!prev) {
+            byPath.set(r.path, { ...r })
+            continue
+        }
+        const error = [prev.error, r.error].filter(Boolean).join('; ')
+        byPath.set(r.path, { path: r.path, ok: prev.ok && r.ok, error: error || undefined })
+    }
+    return [...byPath.values()]
+}
+
+// One logical tracks update: per-path write results plus a reference to the
+// re-index job the write enqueued (poll it with pollReindex to learn whether
+// it actually caught the index up).
+export interface UpdateTracksResult {
+    results: UpdateResult[]
+    reindex?: ReindexRef
+    // A partial album-identity edit may have split the album; see the server's
+    // updateTracks handler. Human-readable, surfaced once per save.
+    warning?: string
+}
+
+// updateTracksPartitioned performs one logical tracks update, transparently
+// splitting it into the two sequential PUTs the server requires when a patch
+// both renames artists and sets their MB IDs. Shared by useUpdateTracks and
+// the edit-session save (which needs the raw call without per-batch toasts).
+// When the patch is split, the second write's reindex ref is the one reported;
+// the first is only reported when the split short-circuits.
+export async function updateTracksPartitioned(
+    body: UpdateTracksRequest
+): Promise<UpdateTracksResult> {
+    const parts = partitionFields(body.fields)
+    if (!parts) return MetadataApi.updateTracks(body)
+    const first = await MetadataApi.updateTracks({ ...body, fields: parts.names })
+    if (!first.results.some((r) => r.ok)) return first
+    const second = await MetadataApi.updateTracks({ ...body, fields: parts.mbids })
+    return {
+        results: mergeUpdateResults(first.results, second.results),
+        reindex: second.reindex ?? first.reindex,
+        // The identity fields ride in the names batch (first), so its warning
+        // is the one that matters; fall back either way since it is one message.
+        warning: first.warning ?? second.warning
+    }
+}
+
+export function useUpdateTracks() {
+    const qc = useQueryClient()
+    const toast = useToast()
+    const abort = new AbortController()
+    // failSilently (2nd arg): no-op without a warning when the mutation is
+    // built bare in a unit test (no active effect scope); in the app it aborts
+    // the poll when the owning component's scope tears down.
+    onScopeDispose(() => abort.abort(), true)
+    return useMutation({
+        mutationFn: async (body: UpdateTracksRequest) => {
+            const out = await updateTracksPartitioned(body)
+            const { failed, pending } = await pollReindex(
+                out.reindex ? [out.reindex.execution_id] : [],
+                { signal: abort.signal }
+            )
+            return { ...out, reindexFailed: failed > 0 || pending > 0 }
+        },
+        onSuccess: (out) => {
+            invalidateAfterMetadataWrite(qc)
+            const results = out.results
+            const ok = results.filter((r) => r.ok).length
+            const failed = results.length - ok
+            if (out.reindexFailed) {
+                toast.add({
+                    severity: 'warn',
+                    summary: 'Saved, but the index was not updated',
+                    detail: 'The re-index did not complete; a full scan will fix it.',
+                    life: 8000
+                })
+            }
+            if (failed === 0) {
+                toast.add({
+                    severity: 'success',
+                    summary: `${ok} of ${results.length} saved`,
+                    life: 3000
+                })
+            } else {
+                toast.add({
+                    severity: 'warn',
+                    summary: `${ok} of ${results.length} saved, ${failed} failed`,
+                    detail: results
+                        .filter((r) => !r.ok)
+                        .map((r) => `${r.path}: ${r.error}`)
+                        .join('\n'),
+                    life: 8000
+                })
+            }
+        },
+        onError: (err: any) => {
+            toast.add({
+                severity: 'error',
+                summary: 'Failed to save metadata',
+                detail: apiErrorMessage(err),
+                life: 5000
+            })
+        }
+    })
+}
+
+// useRawTags loads the complete tag maps of the given paths for the raw
+// editor. Only enabled while the raw view is open.
+export function useRawTags(
+    scanFolder: () => string | null,
+    paths: () => string[],
+    enabled: () => boolean
+) {
+    return useQuery({
+        queryKey: ['metadata', 'raw', scanFolder, paths],
+        queryFn: () => MetadataApi.getRawTags(scanFolder() as string, paths()),
+        enabled: () => enabled() && scanFolder() !== null && paths().length > 0,
+        staleTime: 15_000
+    })
+}
+
+// useMetadataCapabilities reports which optional editor features the server
+// supports (currently: fingerprint identification). Static per server run.
+export function useMetadataCapabilities() {
+    return useQuery<MetadataCapabilities>({
+        queryKey: ['metadata', 'capabilities'],
+        queryFn: MetadataApi.getMetadataCapabilities,
+        staleTime: Infinity
+    })
+}
+
+// useIdentifyTracks resolves files to MusicBrainz recording candidates by
+// acoustic fingerprint. Identification writes nothing, so no invalidation.
+// IdentifyTracksVariables carries the optional abort signal alongside the
+// request body, so the caller can cancel a run that is already in flight.
+export interface IdentifyTracksVariables {
+    body: IdentifyRequest
+    signal?: AbortSignal
+}
+
+export function useIdentifyTracks() {
+    const toast = useToast()
+    return useMutation({
+        mutationFn: (vars: IdentifyTracksVariables) =>
+            MetadataApi.identifyTracks(vars.body, vars.signal),
+        onError: (err: any) => {
+            // A cancel the user asked for is not a failure; toasting it would
+            // report an error for the button they just pressed.
+            if (isCanceledError(err)) return
+            toast.add({
+                severity: 'error',
+                summary: 'Failed to identify tracks',
+                detail: apiErrorMessage(err),
+                life: 5000
+            })
+        }
+    })
+}
+
+// IdentifyAlbumVariables carries the optional abort signal alongside the request
+// body, so the caller can cancel a run that is already in flight.
+export interface IdentifyAlbumVariables {
+    body: IdentifyAlbumRequest
+    signal?: AbortSignal
+}
+
+// useIdentifyAlbum maps the selected files onto one release. Like
+// useIdentifyTracks it writes nothing, so there is no invalidation.
+export function useIdentifyAlbum() {
+    const toast = useToast()
+    return useMutation({
+        mutationFn: (vars: IdentifyAlbumVariables) =>
+            MetadataApi.identifyAlbum(vars.body, vars.signal),
+        onError: (err: any) => {
+            // A cancel the user asked for is not a failure; toasting it would
+            // report an error for the button they just pressed.
+            if (isCanceledError(err)) return
+            toast.add({
+                severity: 'error',
+                summary: 'Failed to identify album',
+                detail: apiErrorMessage(err),
+                life: 5000
+            })
+        }
+    })
+}
+
+// PictureMutationOptions tunes the shared picture mutations for a caller that
+// drives many of them in one logical save. `quiet` hands ALL per-op polling and
+// reporting to that caller: the internal reindex poll, the success toast, the
+// "index not updated" reindex warning, and the cache invalidation are all
+// suppressed, so an N-cell save polls the collected execution ids once and
+// raises one aggregate report and invalidation at the end of the loop instead
+// of N times mid-save — each mid-loop poll/invalidation would otherwise
+// serialize the batch and refetch the editor's own active query, re-triggering
+// the session's prune while it is still writing (see
+// useEditSession.savePictures / save).
+export interface PictureMutationOptions {
+    quiet?: boolean
+}
+
+export function useApplyPicture(opts: PictureMutationOptions = {}) {
+    const qc = useQueryClient()
+    const toast = useToast()
+    const abort = new AbortController()
+    // failSilently (2nd arg): no-op without a warning when the mutation is
+    // built bare in a unit test (no active effect scope); in the app it aborts
+    // the poll when the owning component's scope tears down.
+    onScopeDispose(() => abort.abort(), true)
+    return useMutation({
+        mutationFn: async (form: FormData) => {
+            const out = await MetadataApi.applyPicture(form)
+            // A quiet caller (batch/session save) owns polling: it collects
+            // every write's reindex id and polls them all once at the end, so
+            // polling here too would serialize one poll per cell into its loop.
+            // Skip it and return the write result — reindex ref intact — for
+            // the caller to collect.
+            if (opts.quiet) return { ...out, reindexFailed: false }
+            const { failed, pending } = await pollReindex(
+                out.reindex ? [out.reindex.execution_id] : [],
+                { signal: abort.signal }
+            )
+            return { ...out, reindexFailed: failed > 0 || pending > 0 }
+        },
+        onSuccess: (out) => {
+            // A quiet caller (batch/session save) owns invalidation and the
+            // aggregate report; stay out of its way so it fires exactly once.
+            if (opts.quiet) return
+            invalidateAfterMetadataWrite(qc)
+            // The image is written either way; warn when the index did not catch
+            // up, or the album keeps serving the old cover with no explanation.
+            if (out.reindexFailed) {
+                toast.add({
+                    severity: 'warn',
+                    summary: 'Saved, but the index was not updated',
+                    detail: 'The re-index did not complete; a full scan will fix it.',
+                    life: 8000
+                })
+            }
+            toast.add({ severity: 'success', summary: 'Picture saved', life: 3000 })
+        },
+        onError: (err: any) => {
+            toast.add({
+                severity: 'error',
+                summary: 'Failed to save picture',
+                detail: apiErrorMessage(err),
+                life: 5000
+            })
+        }
+    })
+}
+
+export function useDeletePicture(opts: PictureMutationOptions = {}) {
+    const qc = useQueryClient()
+    const toast = useToast()
+    const abort = new AbortController()
+    // failSilently (2nd arg): no-op without a warning when the mutation is
+    // built bare in a unit test (no active effect scope); in the app it aborts
+    // the poll when the owning component's scope tears down.
+    onScopeDispose(() => abort.abort(), true)
+    return useMutation({
+        mutationFn: async (v: {
+            scanFolder: string
+            type: string
+            slot: PictureSlot
+            paths: string[]
+        }) => {
+            const out = await MetadataApi.deletePicture(v.scanFolder, v.paths, v.type, v.slot)
+            // See useApplyPicture: a quiet caller polls the batch itself.
+            if (opts.quiet) return { ...out, reindexFailed: false }
+            const { failed, pending } = await pollReindex(
+                out?.reindex ? [out.reindex.execution_id] : [],
+                { signal: abort.signal }
+            )
+            return { ...out, reindexFailed: failed > 0 || pending > 0 }
+        },
+        onSuccess: (out) => {
+            // A quiet caller (batch/session save) owns invalidation and the
+            // aggregate report; stay out of its way so it fires exactly once.
+            if (opts.quiet) return
+            invalidateAfterMetadataWrite(qc)
+            if (out.reindexFailed) {
+                toast.add({
+                    severity: 'warn',
+                    summary: 'Saved, but the index was not updated',
+                    detail: 'The re-index did not complete; a full scan will fix it.',
+                    life: 8000
+                })
+            }
+            toast.add({ severity: 'success', summary: 'Picture removed', life: 3000 })
+        },
+        onError: (err: any) => {
+            toast.add({
+                severity: 'error',
+                summary: 'Failed to remove picture',
+                detail: apiErrorMessage(err),
+                life: 5000
+            })
+        }
+    })
+}
+
+// ----- Pure helpers (exported for unit tests) -----
+
+export interface FieldDiff<T> {
+    shared: boolean
+    value: T
+}
+
+export interface InitialValues {
+    title: FieldDiff<string>
+    album: FieldDiff<string>
+    mb_recording_id: FieldDiff<string>
+    mb_release_id: FieldDiff<string>
+    mb_release_group_id: FieldDiff<string>
+    artists: FieldDiff<string[]>
+    album_artists: FieldDiff<string[]>
+    genres: FieldDiff<string[]>
+    release_types: FieldDiff<string[]>
+    year: FieldDiff<number>
+    track_number: FieldDiff<number>
+    disc_number: FieldDiff<number>
+    disc_subtitle: FieldDiff<string>
+    grouping: FieldDiff<string>
+    compilation: FieldDiff<boolean>
+}
+
+/**
+ * Compute per-field shared/mixed state across a selection of tracks.
+ * `shared: true` means every selected track has the same value (returned as `value`).
+ * `shared: false` means values differ; `value` is a neutral zero ('' / [] / 0 / false).
+ */
+export function diffInitialValues(tracks: Track[]): InitialValues {
+    const scalar = <
+        K extends
+            | 'title'
+            | 'album'
+            | 'disc_subtitle'
+            | 'grouping'
+            | 'mb_recording_id'
+            | 'mb_release_id'
+            | 'mb_release_group_id'
+    >(
+        key: K
+    ): FieldDiff<string> => {
+        if (tracks.length === 0) return { shared: true, value: '' }
+        const v = tracks[0][key]
+        const all = tracks.every((t) => t[key] === v)
+        return all ? { shared: true, value: v } : { shared: false, value: '' }
+    }
+    const num = (key: 'year' | 'track_number' | 'disc_number'): FieldDiff<number> => {
+        if (tracks.length === 0) return { shared: true, value: 0 }
+        const v = tracks[0][key]
+        const all = tracks.every((t) => t[key] === v)
+        return all ? { shared: true, value: v } : { shared: false, value: 0 }
+    }
+    const bool = (key: 'compilation'): FieldDiff<boolean> => {
+        if (tracks.length === 0) return { shared: true, value: false }
+        const v = tracks[0][key]
+        const all = tracks.every((t) => t[key] === v)
+        return all ? { shared: true, value: v } : { shared: false, value: false }
+    }
+    const arr = (
+        key: 'artists' | 'album_artists' | 'genres' | 'release_types'
+    ): FieldDiff<string[]> => {
+        if (tracks.length === 0) return { shared: true, value: [] }
+        const first = tracks[0][key]
+        const all = tracks.every(
+            (t) => t[key].length === first.length && t[key].every((x, i) => x === first[i])
+        )
+        return all ? { shared: true, value: [...first] } : { shared: false, value: [] }
+    }
+    return {
+        title: scalar('title'),
+        album: scalar('album'),
+        mb_recording_id: scalar('mb_recording_id'),
+        mb_release_id: scalar('mb_release_id'),
+        mb_release_group_id: scalar('mb_release_group_id'),
+        artists: arr('artists'),
+        album_artists: arr('album_artists'),
+        genres: arr('genres'),
+        release_types: arr('release_types'),
+        year: num('year'),
+        track_number: num('track_number'),
+        disc_number: num('disc_number'),
+        disc_subtitle: scalar('disc_subtitle'),
+        grouping: scalar('grouping'),
+        compilation: bool('compilation')
+    }
+}
+
+export interface EditValues {
+    title: string
+    album: string
+    mb_release_id: string
+    mb_release_group_id: string
+    artists: string[]
+    album_artists: string[]
+    genres: string[]
+    year: number
+    track_number: number
+    disc_number: number
+    disc_subtitle: string
+    grouping: string
+    compilation: boolean
+}
+
+export interface ArtistMbidRow {
+    name: string
+    mbid: string
+    mixed: boolean
+}
+
+/**
+ * Collapse a track selection into one row per distinct artist name, carrying
+ * that name's shared MusicBrainz ID. `mixed` is true when selected tracks
+ * disagree on the ID for that name (in which case `mbid` is '').
+ * `nameField`/`idField` are aligned positionally within each track.
+ */
+export function distinctArtistMbids(
+    tracks: Track[],
+    nameField: 'artists' | 'album_artists',
+    idField: 'mb_artist_ids' | 'mb_album_artist_ids'
+): ArtistMbidRow[] {
+    const order: string[] = []
+    const seen = new Map<string, Set<string>>()
+    for (const t of tracks) {
+        const names = t[nameField]
+        const ids = t[idField]
+        names.forEach((name, i) => {
+            const id = ids[i] ?? ''
+            if (!seen.has(name)) {
+                seen.set(name, new Set())
+                order.push(name)
+            }
+            seen.get(name)!.add(id)
+        })
+    }
+    return order.map((name) => {
+        const ids = seen.get(name)!
+        if (ids.size === 1) {
+            return { name, mbid: [...ids][0], mixed: false }
+        }
+        return { name, mbid: '', mixed: true }
+    })
+}

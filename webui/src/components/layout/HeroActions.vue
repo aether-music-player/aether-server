@@ -1,0 +1,98 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import Button from 'primevue/button'
+
+// The props keep the Subsonic wire vocabulary (`starred`, `star`); the visible
+// wording is "favorite" to match the heart icon used everywhere.
+const props = withDefaults(
+    defineProps<{
+        playLabel?: string
+        playDisabled?: boolean
+        busy?: boolean
+        canQueue?: boolean
+        canStar?: boolean
+        starred?: boolean
+    }>(),
+    {
+        playLabel: 'Play',
+        playDisabled: false,
+        busy: false,
+        canQueue: false,
+        canStar: false,
+        starred: false
+    }
+)
+
+const favoriteLabel = computed(() =>
+    props.starred ? 'Remove from favorites' : 'Add to favorites'
+)
+
+const emit = defineEmits<{
+    (e: 'play'): void
+    (e: 'queue'): void
+    (e: 'star'): void
+}>()
+</script>
+
+<template>
+    <div class="hero-actions">
+        <Button
+            class="hero-action-play"
+            :label="playLabel"
+            icon="ms-play-arrow"
+            :disabled="playDisabled"
+            :loading="busy"
+            @click="emit('play')"
+        />
+        <Button
+            v-if="canQueue"
+            class="hero-action-queue"
+            label="Add to queue"
+            icon="ms-add"
+            severity="secondary"
+            text
+            @click="emit('queue')"
+        />
+        <!-- `secondary` like the queue action beside it: a favorite reads as
+             favorite by the FILLED icon alone, not by colour — without a severity
+             this rendered in the primary accent in BOTH states, which said nothing
+             about the state and competed with the accent's real jobs (what is
+             playing, what is actionable). See unified-play-experience.md. -->
+        <Button
+            v-if="canStar"
+            class="hero-action-star"
+            :icon="starred ? 'ms-favorite' : 'mso-favorite'"
+            :aria-label="favoriteLabel"
+            severity="secondary"
+            text
+            rounded
+            v-tooltip.bottom="favoriteLabel"
+            @click="emit('star')"
+        />
+    </div>
+</template>
+
+<style scoped>
+.hero-actions {
+    display: flex;
+    align-items: center;
+    /* Wrap rather than let a narrow column (e.g. with the queue panel open)
+       shrink the buttons until their labels clip — matches HeroSelectionBar. */
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.4rem;
+}
+
+/* A wrapped actions ROW is fine; a wrapped label ("Add\nto\nqueue") is not. */
+.hero-actions :deep(.p-button-label) {
+    white-space: nowrap;
+}
+
+/* Phone: wrap action buttons and center them when space is tight. */
+@media (max-width: 767.98px) {
+    .hero-actions {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+}
+</style>

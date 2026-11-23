@@ -1,0 +1,99 @@
+# Testing — gates, commands, conventions
+
+The full gate is `make verify` from the repo root — run it before calling any
+work done. It runs the server gate (`make -C server verify`: `test` →
+`license-check` → `lint` → `benchmark` → `coverage`), then `ui-test` →
+`spec-lint` → `player-lint` → `player-test`, collects all failures, and fails
+if any target failed. CI runs the same pieces, one workflow per component in
+`.github/workflows/`, each on pushes to `main` and on pull requests, so a check
+reads `<component> / <job>` on a PR: `server.yml` (`test` = `make test` +
+`make coverage`, `lint` = golangci-lint, `license-check`, `spec-lint`),
+`webui.yml` (`test` = `make ui-test` + `make package-ui`) and `player.yml`
+(`lint + test`). `release.yml` and `site.yml` are the tag-time workflows.
+
+The Go targets live in `server/Makefile` (run them there, e.g.
+`cd server && make verify` for a Go-only gate); the root `Makefile` delegates
+to it, so every target below also works from the repo root.
+
+| Target | What it runs |
+|---|---|
+| `make test` | `go test ./... -cover` — the fast Go suite |
+| `make ui-test` | `cd webui && npm test` = `vue-tsc --noEmit` + `vitest run` |
+| `make lint` | `golangci-lint run` (v2 config; CI pins v2.12.2 to avoid gosec ruleset skew) |
+| `make coverage` | **per-package** total over `./internal/...`, threshold **70%** each |
+| `make benchmark` | `go test -bench=. ./...` |
+| `make license-check` | `go-licence-detector` against `server/allowedLicenses.json` / `server/overrideLicenses.json` |
+| `make spec-lint` | Spectral over `docs/openapi/aether-v0.yaml` (root only) |
+| `make player-lint` | `cargo fmt --all -- --check` + `cargo clippy --workspace -- -D warnings` in `player/` |
+| `make player-test` | `cargo test --workspace` in `player/` |
+| `make verify` | all of the above; the definition of done (in `server/`: the Go checks only) |
+
+- The two player gates need a Rust toolchain (rustup, stable) and, on Linux,
+  the webkit2gtk / appindicator / alsa / dbus development packages —
+  `make -C player check-deps` names what is missing and the apt line. They
+  compile `src-tauri`, which embeds `webui/dist`; `player/Makefile` builds it
+  when absent. Conventions and layout: [player/testing.md](player/testing.md).
+- The coverage gate is per `internal/` package, not a repo total. A new
+  `internal/` package below 70% fails `verify` — write the tests, don't lower
+  `COVERAGE_THRESHOLD`. `app/`, `libs/`, and `webui` are outside this gate.
+- Lint policy (`server/.golangci.yaml`): standard set + `nolintlint`, `gocyclo`
+  (min-complexity 20), `nestif`, `gosec`, `dupl`. `nolint` directives must
+  name the linter and carry an explanation (`require-explanation: true`).
+  The gosec path-traversal suppressions for the media handlers are documented
+  in the config with their justification — keep it true (see
+  [subsonic-api.md](subsonic-api.md)).
+
+## Go test conventions
+
+- **Real SQLite, not mocks.** Store, handler, and scanner tests construct a
+  real `store.Store` over `glebarez/sqlite` (pure-Go, no cgo) with an
+  in-memory/temp DB and run `model.Migrate`. New handler tests should mirror
+  a sibling `_test.go` (e.g. `subsonic/radio_test.go`) rather than
+  introducing a store interface/mock.
+- Tests live next to the code; external test packages (`package foo_test`)
+  are the norm, with `_internal_test.go` for white-box cases.
+- Fixtures: real audio files under `internal/tags/testdata`,
+  `internal/metadataedit/testdata`, `libs/covergen/testdata`.
+- `libs/covergen` and `libs/covergen/allstyles` guard default appearance with
+  local-only golden-PNG tests (`TestGolden`, `TestTextGoldens` for the text
+  overlay) — bless with `-run TestGolden -update` / `-run TestTextGoldens
+  -update`. Goldens live in gitignored `testdata/` dirs and the tests **skip**
+  (not fail) when a golden is absent, so a fresh checkout or CI never gates on
+  them; only a local `-update` run commits you to a new baseline.
+- Test files are excluded from `nestif`, `dupl`, `gosec` — table-driven tests
+  with some duplication are fine.
+- Optional external binaries (ffprobe, fpcalc) must not break the suite:
+  tests that need them skip when unavailable, matching the runtime
+  "optional dependency" design ([architecture.md](architecture.md)).
+
+## Frontend test conventions
+
+- Vitest + @vue/test-utils, jsdom; specs in `__tests__/` beside the code.
+- `npm test` type-checks first — a TS error fails the suite even with green
+  runtime tests.
+- View specs follow the checklist in
+  `docs/architecture/main-content-view-layout.md` §8 (title, pluralized
+  summary absent at zero, actions in header, empty/loading states);
+  `RadioView.spec.ts` and `LibraryView.spec.ts` are the templates.
+- Stable hook classes (`.edit-action-save`, `.hero-action-play`, …) exist for
+  tests — target those, not structural selectors.
+
+## Running the app locally
+
+- `make run` — Go server with debug logging (`AETHER_ENV_LOGLEVEL=debug`),
+  started from `server/` with the dev config `server/zarf/localdata/config.yaml`:
+  data in `server/zarf/localdata/data`, scans `server/zarf/locallibrary` (both
+  git-ignored), provider keys from `server/*.api.key`; serves whatever UI build
+  is currently embedded.
+- `make sample-library` — downloads ~1 GB of CC / Live Music Archive albums
+  from archive.org into `server/zarf/locallibrary/sample-library` (script and
+  album list: `server/zarf/samplelibrary/fetch.sh`, each entry noting the
+  edge case it covers: FLAC vs MP3, embedded vs folder art, composer tags,
+  a various-artists compilation, untagged files). No release-type or
+  MusicBrainz tags — tag with Picard to exercise those.
+- `make run-ui` — rebuilds the SPA, copies it into `server/app/spa/files/ui`,
+  then runs the server.
+- `cd webui && npm run dev` — Vite dev server for UI work (set
+  `VITE_SERVER_URL_V0` if not proxying).
+
+See [releasing.md](releasing.md) for the release-time gates.

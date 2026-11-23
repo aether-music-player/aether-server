@@ -1,0 +1,214 @@
+/* Hidden themes — unlocked by clicking the wordmark's "e" five times (see
+   useTheme.ts / AppSidebar.vue). Both are token-level repaints layered on top of
+   `.dark-mode`: useTheme keeps `.dark-mode` on the root for these modes so the
+   PrimeVue preset stays in its dark colour scheme, and only colour tokens
+   change. Declared after `.dark-mode` in _main.scss so they win.
+
+   Two token families need repainting, not one:
+     `--app-*`      our own tokens (_variables.scss)
+     `--c-primary-*` PrimeVue's primary ramp, emitted at runtime from theme.js
+                     with the `c` prefix configured in main.ts. Every PrimeVue
+                     component painted "primary" — the ContentScaffold action
+                     buttons, SelectButtons, links, focus rings — resolves
+                     through these, so skipping them leaves cyan buttons on a
+                     green theme. The `.dark-mode.theme-*` selector outranks the
+                     `:root` / `.dark-mode` rules PrimeVue injects, so a plain
+                     override is enough. In the dark scheme `primary.color`
+                     derives from `primary.400` (theme.js), hence 400 carries
+                     each theme's accent.
+
+   Adding another: define the same token set below, add the mode to
+   HIDDEN_MODES + HIDDEN_THEME_OPTIONS, and nothing else needs to know. */
+
+/* ── Winamp ────────────────────────────────────────────────────────────────
+   The classic "base" skin: slate-purple chrome panels, a black LCD readout in
+   pure #00ff00, cream titlebar text and the equalizer's yellow. Values sampled
+   from a screenshot of the original skin rather than guessed:
+     chrome    #363553 / #2b3044 / #201e31 / #120f1b
+     LCD green #00ff00, dim #007c00
+     cream     #ffffec (titlebar text)
+     EQ yellow #fdf234
+   Effect-free by design, so it can't render oddly. */
+.dark-mode.theme-winamp {
+    /* Canvas is the darkest chrome; panels step up to the titlebar slate. */
+    --app-background: #120f1b;
+    --app-surface: #201e31;
+    --app-surface-2: #2b3044;
+    --app-bg-subtle: #363553;
+    --app-border: #3d3a54;
+    /* Text is the cream of the titlebar; the green is reserved for the accent
+       so it reads as a readout rather than as body copy. */
+    --app-text-primary: #ffffec;
+    --app-text-secondary: #9a96b5;
+    --app-accent: #00ff00;
+    --app-accent-hover: #6fff6f;
+    --app-accent-soft: rgba(0, 255, 0, 0.14);
+    --app-accent-soft-hover: rgba(0, 255, 0, 0.22);
+    /* Staged edits borrow the equalizer slider yellow. */
+    --app-staged: #fdf234;
+    --app-staged-soft: rgba(253, 242, 52, 0.14);
+    --app-hover: rgba(0, 255, 0, 0.08);
+    --app-nav-bg: #201e31;
+    --app-nav-text: #ffffec;
+    --app-nav-text-dim: #837d88;
+    --app-nav-brand: #00ff00;
+    --app-nav-brand-alt: #fdf234;
+    /* The player bar is the LCD panel: black, green, mono. */
+    --app-player-bg: #000000;
+    --app-player-text: #00ff00;
+    --app-player-dim: #007c00;
+    --app-player-track: rgba(0, 255, 0, 0.22);
+    /* An idle rail is the LCD's dim green — the bright #00ff00 is the hover
+       state, matching how the original skin lit only what you were touching. */
+    --app-player-range: #007c00;
+    --app-player-time-font: var(--font-mono);
+
+    /* PrimeVue primary ramp — the LCD green, stepped down to near-black. */
+    --c-primary-50: #eaffea;
+    --c-primary-100: #c8ffc8;
+    --c-primary-200: #96ff96;
+    --c-primary-300: #5aff5a;
+    --c-primary-400: #00ff00;
+    --c-primary-500: #00d400;
+    --c-primary-600: #00a800;
+    --c-primary-700: #007c00;
+    --c-primary-800: #005a00;
+    --c-primary-900: #004000;
+    --c-primary-950: #002200;
+    --c-primary-color: #00ff00;
+    --c-primary-hover-color: #6fff6f;
+    --c-primary-active-color: #96ff96;
+    /* Filled buttons put this on top of the green, so it has to be dark. */
+    --c-primary-contrast-color: #001400;
+}
+
+/* The LCD readout: the player bar is the one surface that goes full green-on-
+   black, so the track text and clock match the original's display. */
+.dark-mode.theme-winamp .player-controls {
+    .now-title,
+    .now-artist,
+    .time-label {
+        color: var(--app-player-text);
+        font-family: var(--font-mono);
+        letter-spacing: 0.02em;
+    }
+
+    .now-artist {
+        color: var(--app-player-dim);
+    }
+}
+
+/* ── CRT ───────────────────────────────────────────────────────────────────
+   Phosphor green on near-black, with scanlines and a text glow. */
+.dark-mode.theme-crt {
+    --app-background: #040804;
+    --app-surface: #081008;
+    --app-surface-2: #0c180c;
+    --app-bg-subtle: #0e1c0e;
+    --app-border: #1b3a1b;
+    --app-text-primary: #33ff66;
+    --app-text-secondary: #1f9944;
+    --app-accent: #66ffaa;
+    --app-accent-hover: #99ffcc;
+    --app-accent-soft: rgba(102, 255, 170, 0.14);
+    --app-accent-soft-hover: rgba(102, 255, 170, 0.22);
+    --app-staged: #ffe66d;
+    --app-staged-soft: rgba(255, 230, 109, 0.14);
+    --app-hover: rgba(51, 255, 102, 0.09);
+    --app-nav-bg: #020502;
+    --app-nav-text: #33ff66;
+    --app-nav-text-dim: #1f9944;
+    --app-nav-brand: #66ffaa;
+    --app-nav-brand-alt: #33ff66;
+    --app-player-bg: #010301;
+    --app-player-text: #33ff66;
+    --app-player-dim: #1f9944;
+    --app-player-track: rgba(51, 255, 102, 0.2);
+    /* Dim phosphor when idle; the mint accent is the hover state. */
+    --app-player-range: #1f9944;
+    --app-player-time-font: var(--font-mono);
+
+    /* PrimeVue primary ramp — the phosphor mint of --app-accent. */
+    --c-primary-50: #eafff4;
+    --c-primary-100: #c6ffe4;
+    --c-primary-200: #99ffcc;
+    --c-primary-300: #80ffbb;
+    --c-primary-400: #66ffaa;
+    --c-primary-500: #33ff66;
+    --c-primary-600: #1fdb55;
+    --c-primary-700: #17a842;
+    --c-primary-800: #10752e;
+    --c-primary-900: #0a4a1e;
+    --c-primary-950: #052610;
+    --c-primary-color: #66ffaa;
+    --c-primary-hover-color: #99ffcc;
+    --c-primary-active-color: #c6ffe4;
+    --c-primary-contrast-color: #021208;
+}
+
+/* Phosphor bleed. Kept to headings, nav and the player bar rather than every
+   glyph: a global text-shadow makes dense track lists hard to read. */
+.dark-mode.theme-crt {
+    h1,
+    h2,
+    h3,
+    .nav-item,
+    .logo,
+    .brand-mark,
+    .player-controls {
+        text-shadow: 0 0 5px currentColor;
+    }
+}
+
+/* Scanlines. Painted on <html> via ::after so nothing in the app — dialogs and
+   toasts included — sits above it, and pointer-events stay with the app. The
+   fixed layer is only created for this theme, so other themes pay nothing.
+
+   Two-tone stripes, not just dark ones: `--app-background` is #040804, so a
+   black stripe has essentially nothing left to darken (0.22 black over #040804
+   composites to #030603 — one step out of 255) and the pattern only shows where
+   bright glyphs happen to sit. The faint phosphor line is what makes the raster
+   visible across the empty canvas; the dark line is what gives glyphs their
+   banding.
+
+   Bands are 2px on a 4px period. A 1px band is a single device pixel at
+   dpr 1 and gets averaged toward its neighbours once the display or zoom is
+   scaled, which thins the pattern unpredictably; 2px keeps a whole pixel of
+   each colour in every case. Hard stops (two stops at the same offset) keep the
+   edges crisp rather than letting the gradient interpolate the stripe away.
+
+   Alphas are deliberately low. The dark band covers half the viewport, so it
+   dominates the perceived strength: at 0.34 it dimmed the whole UI and read as
+   a heavy veil rather than a raster. 0.16 keeps the banding legible on glyphs
+   without washing the interface out, and the phosphor line is held well under
+   it so it textures the canvas instead of adding a green cast. */
+.dark-mode.theme-crt::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+        to bottom,
+        rgba(51, 255, 102, 0.03) 0,
+        rgba(51, 255, 102, 0.03) 2px,
+        rgba(0, 0, 0, 0.16) 2px,
+        rgba(0, 0, 0, 0.16) 4px
+    );
+}
+
+/* No `prefers-reduced-motion` guard: the overlay is a static gradient with no
+   animation or transition, so that query does not apply to it. It used to be
+   gated that way, which switched the whole effect off for anyone whose desktop
+   reports reduced motion — the palette still changed, so the theme looked
+   "colours only, no effect". Worse, browsers disagree about what counts: Chrome
+   on Linux maps KDE's low AnimationDurationFactor to reduced motion while
+   Firefox does not, so the same machine showed scanlines in one browser and a
+   flat theme in the other.
+   `prefers-contrast: more` is the query that does apply: the overlay trades
+   contrast for texture, so drop it when the user asks for more contrast. */
+@media (prefers-contrast: more) {
+    .dark-mode.theme-crt::after {
+        display: none;
+    }
+}

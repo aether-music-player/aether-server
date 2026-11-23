@@ -1,0 +1,551 @@
+package subsonic
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/andresbott/aether/internal/assetkey"
+	"github.com/andresbott/aether/internal/assetstore"
+	"github.com/andresbott/aether/internal/imagecache"
+	"github.com/andresbott/aether/internal/model"
+	"github.com/andresbott/aether/internal/tags"
+	"github.com/andresbott/aether/libs/covergen"
+	"github.com/andresbott/aether/libs/covergen/allstyles"
+	"github.com/andresbott/aether/libs/covergen/fonts"
+)
+
+func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+	idStr := paramStr(r, "id")
+	if idStr == "" {
+		writeError(w, 10, "missing id parameter")
+		return
+	}
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "track" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	filePath, err := h.store.GetTrackFilePath(id)
+	if err != nil {
+		writeError(w, 70, "song not found")
+		return
+	}
+	// The path comes from the DB, not the request, so a row pointing outside every
+	// configured scan folder is a data defect rather than an attack — but serving it
+	// would hand out an arbitrary readable file, so it is refused as "not found"
+	// (no oracle for what exists outside the scan folders).
+	if !h.mediaPathAllowed(filePath) {
+		writeError(w, 70, "song not found")
+		return
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		writeError(w, 70, "song not found")
+		return
+	}
+	// Track IDs are not stable across rescans: a rebuilt DB reassigns tr-N to a
+	// different song while the URL stays the same. Plain http.ServeFile sends no
+	// cache policy, so browsers heuristically cache the audio and keep playing
+	// the pre-rescan song — and its Last-Modified validator can wrongly answer
+	// 304 when the reassigned file is older. Same failure mode as covers: force
+	// revalidation and key the validator on which file is served (see
+	// serveCoverFile).
+	w.Header().Set("Cache-Control", "no-cache")
+	serveETaggedFile(w, r, filePath, info)
+}
+
+// mediaPathAllowed reports whether the handlers may read path. Every path it
+// guards comes from the database — a track's file_path, an album's cover_path —
+// so this enforces that the row actually points into a configured scan folder.
+// No guard at all (the option was not given) allows everything; that is the
+// test seam, never production — router.New always gives WithMediaRoots, and
+// with no roots the guard denies.
+func (h *Handler) mediaPathAllowed(path string) bool {
+	if h.mediaGuard == nil {
+		return true
+	}
+	return h.mediaGuard.Allows(path)
+}
+
+type coverMeta struct {
+	coverPath string
+	// coverManaged marks coverPath as a file aether itself wrote to its asset
+	// store (a manual upload, an auto-fetched artist image) rather than a path
+	// that came out of a scan folder. The media guard only applies to the
+	// latter: the asset store lives under the data dir, outside every scan
+	// folder root, so guarding it would refuse every uploaded cover.
+	coverManaged bool
+	albumID      uint
+	seed         string
+	// title is the entity's display name, drawn onto the generated cover as its
+	// text overlay (empty renders the textless art). It is kept out of seed — the
+	// normalized, rename-stable identity that drives the artwork — so a display
+	// rename recaptions without redrawing the art; it lives in the derivative
+	// fingerprint instead.
+	title string
+	// cacheKind/cacheKey file this entity's cached derivatives (imagecache
+	// mirrors the assetstore layout: <kind>/<key>/). They identify the entity,
+	// not the winning source — which source wins changes as uploads land and
+	// are removed, and the per-derivative fingerprint covers that.
+	cacheKind string
+	cacheKey  string
+}
+
+// artistCoverMeta resolves an artist's cover. A cover keyed by MusicBrainz ID
+// (auto-fetched or a manual upload made while the artist was matched) takes
+// precedence; then the name-hash slot used for unmatched artists or artists
+// that gained an MBID since their upload; then an image found next to the
+// artist's albums on disk (`ImagePath`, set by the scanner for
+// `<collection>/<artist>/<album>` layouts). Nothing found means the
+// name-seeded generated avatar.
+func (h *Handler) artistCoverMeta(artist *model.Artist) coverMeta {
+	meta := coverMeta{
+		seed:      artist.NameNorm,
+		title:     artist.Name,
+		cacheKind: assetstore.KindArtist,
+		// The cache key is derived from identity (MusicBrainz ID when matched,
+		// otherwise name_norm hash) so it remains stable across DB rebuilds.
+		// Consequence: if an artist gains an MBID after derivatives are cached,
+		// ArtistOf changes and those derivatives are orphaned (a leak, not a
+		// misattribution — no other artist can inherit them). This is accepted
+		// rather than adding cache-eviction logic here.
+		cacheKey: assetkey.ArtistOf(artist),
+	}
+	if artist.MBArtistID != "" {
+		if p, ok := h.assets.Get(assetstore.KindArtist, assetkey.Artist(artist.MBArtistID, artist.NameNorm)); ok {
+			meta.coverPath, meta.coverManaged = p, true
+		}
+	}
+	if meta.coverPath == "" {
+		if p, ok := h.assets.Get(assetstore.KindArtist, assetkey.Artist("", artist.NameNorm)); ok {
+			meta.coverPath, meta.coverManaged = p, true
+		}
+	}
+	if meta.coverPath == "" {
+		meta.coverPath = artist.ImagePath
+	}
+	return meta
+}
+
+// albumCoverMeta resolves an album's cover. A cover uploaded through the
+// updateAlbum extension ("albumCoverArt") takes precedence over the folder file,
+// which in turn beats embedded art.
+func (h *Handler) albumCoverMeta(album *model.Album) coverMeta {
+	meta := coverMeta{
+		coverPath: album.CoverPath,
+		albumID:   album.ID,
+		seed:      album.AlbumArtistNorm + "|" + album.NameNorm,
+		title:     album.Name,
+		cacheKind: assetstore.KindAlbum,
+		cacheKey:  assetkey.AlbumOf(album),
+	}
+	if p, ok := h.assets.Get(assetstore.KindAlbum, assetkey.AlbumOf(album)); ok {
+		meta.coverPath, meta.coverManaged = p, true
+	}
+	return meta
+}
+
+// genreCoverMeta resolves a genre's cover. A manually uploaded cover (see
+// updateGenre) takes precedence; otherwise it falls through to the name-seeded
+// generated cover (same mechanism as artists/radio/playlists).
+func (h *Handler) genreCoverMeta(w http.ResponseWriter, id uint) (coverMeta, bool) {
+	genre, err := h.store.GetGenre(id)
+	if err != nil {
+		writeError(w, 70, "genre not found")
+		return coverMeta{}, false
+	}
+	meta := coverMeta{
+		seed:      genre.Name,
+		title:     genre.Name,
+		cacheKind: assetstore.KindGenre,
+		cacheKey:  assetkey.GenreOf(genre),
+	}
+	if p, ok := h.assets.Get(assetstore.KindGenre, assetkey.GenreOf(genre)); ok {
+		meta.coverPath, meta.coverManaged = p, true
+	}
+	return meta, true
+}
+
+// groupingCoverMeta resolves a grouping's cover. A grouping has no art of its
+// own: it wears the cover of its first album, in the order the grouping lists
+// them.
+func (h *Handler) groupingCoverMeta(w http.ResponseWriter, id uint) (coverMeta, bool) {
+	album, err := h.store.GroupingCoverAlbum(id)
+	if err != nil {
+		writeError(w, 70, "grouping not found")
+		return coverMeta{}, false
+	}
+	return h.albumCoverMeta(album), true
+}
+
+// resolveCoverMeta looks up cover metadata for the given item type and ID.
+// It writes an HTTP error and returns false if the item cannot be found or the
+// type is unsupported.
+func (h *Handler) resolveCoverMeta(w http.ResponseWriter, r *http.Request, itemType string, id uint) (coverMeta, bool) {
+	switch itemType {
+	case "album":
+		album, err := h.store.GetAlbum(id)
+		if err != nil {
+			writeError(w, 70, "album not found")
+			return coverMeta{}, false
+		}
+		return h.albumCoverMeta(album), true
+	case "track":
+		song, err := h.store.GetSong(id)
+		if err != nil {
+			writeError(w, 70, "song not found")
+			return coverMeta{}, false
+		}
+		// A track's cover is its album's, cached under the album's identity so
+		// the two ids share one set of derivatives.
+		if song.Album != nil {
+			return h.albumCoverMeta(song.Album), true
+		}
+		return coverMeta{}, true
+	case "artist":
+		artist, _, err := h.store.GetArtist(id)
+		if err != nil {
+			writeError(w, 70, "artist not found")
+			return coverMeta{}, false
+		}
+		return h.artistCoverMeta(artist), true
+	case "radio":
+		station, err := h.store.GetInternetRadioStation(id)
+		if err != nil {
+			writeError(w, 70, "radio station not found")
+			return coverMeta{}, false
+		}
+		meta := coverMeta{
+			seed:      station.Name,
+			title:     station.Name,
+			cacheKind: assetstore.KindRadio,
+			cacheKey:  assetkey.Radio(station.StreamURL),
+		}
+		if p, ok := h.assets.Get(assetstore.KindRadio, assetkey.Radio(station.StreamURL)); ok {
+			meta.coverPath, meta.coverManaged = p, true
+		}
+		return meta, true
+	case "playlist":
+		pl, err := h.store.GetPlaylist(id)
+		if err != nil || (pl.Owner != requestOwner(r) && !pl.Public) {
+			writeError(w, 70, "playlist not found")
+			return coverMeta{}, false
+		}
+		// A manually uploaded cover (see updatePlaylist) takes precedence;
+		// otherwise fall through to the name-seeded generated cover (same
+		// mechanism as artists/radio).
+		meta := coverMeta{
+			seed:      pl.Name,
+			title:     pl.Name,
+			cacheKind: assetstore.KindPlaylist,
+			cacheKey:  assetkey.PlaylistOf(pl),
+		}
+		key := assetkey.PlaylistOf(pl)
+		if key != "" {
+			if p, ok := h.assets.Get(assetstore.KindPlaylist, key); ok {
+				meta.coverPath, meta.coverManaged = p, true
+			}
+		}
+		return meta, true
+	case "grouping":
+		return h.groupingCoverMeta(w, id)
+	case "genre":
+		return h.genreCoverMeta(w, id)
+	default:
+		writeError(w, 0, "unsupported cover art id type")
+		return coverMeta{}, false
+	}
+}
+
+func (h *Handler) getCoverArt(w http.ResponseWriter, r *http.Request) {
+	idStr := paramStr(r, "id")
+	if idStr == "" {
+		writeError(w, 10, "missing id parameter")
+		return
+	}
+	itemType, id, err := decodeID(idStr)
+	if err != nil {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	meta, ok := h.resolveCoverMeta(w, r, itemType, id)
+	if !ok {
+		return
+	}
+
+	// Force revalidation on every request. Without this, browsers may
+	// heuristically cache a response (e.g. the generated-avatar fallback
+	// served before an artist has a fetched image) and keep serving it from
+	// cache after the underlying file changes, since the URL is unchanged.
+	w.Header().Set("Cache-Control", "no-cache")
+	// One URL serves WebP or JPEG depending on what the client accepts, so any
+	// shared cache must key on Accept as well.
+	w.Header().Set("Vary", "Accept")
+
+	sources := h.coverSources(meta)
+	if len(sources) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	format := imagecache.FormatForAccept(r.Header.Get("Accept"))
+	size := quantizeCoverSize(paramInt(r, "size", maxCoverSize))
+
+	// Walk the candidates in precedence order, falling through when one cannot
+	// be turned into an image. A collection holds truncated cover files and tracks
+	// re-tagged since the scan; answering 500 would leave a broken image in
+	// every grid cell the entity appears in, so a lower-precedence source — in
+	// the worst case the generated cover — takes over.
+	for _, src := range sources {
+		path, err := h.images.Path(imagecache.Request{
+			Kind:        src.kind,
+			Key:         src.key,
+			Name:        src.name,
+			Size:        size,
+			Format:      format,
+			Fingerprint: src.fingerprint,
+			Load:        func() ([]byte, error) { return src.load(size) },
+		})
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		w.Header().Set("Content-Type", format.ContentType())
+		serveETaggedFile(w, r, path, info)
+		return
+	}
+	http.Error(w, "cover art could not be prepared", http.StatusInternalServerError)
+}
+
+// coverSource is the winning source image for an entity's cover, resolved to
+// everything the image cache needs to build and key a derivative from it.
+type coverSource struct {
+	kind string
+	key  string
+	// name separates derivatives of different sources for the same entity, so
+	// the generated fallback never collides with a real cover.
+	name string
+	// fingerprint identifies these source bytes; a change invalidates the
+	// entity's cached derivatives.
+	fingerprint string
+	// load produces the source image; size is the display size the cache will
+	// serve. File-backed sources ignore it (the cache scales their full-res
+	// bytes); the generated source renders covergen at size so its grain lands
+	// at the shown size instead of a downscaled master.
+	load func(size int) ([]byte, error)
+}
+
+// coverSources lists the entity's candidate sources in precedence order — the
+// real cover file (managed store, then the folder/artist image), then the album's
+// embedded front cover, then the name-seeded generated cover. Every candidate is
+// lazy: nothing is read or rendered unless the cache misses and that candidate is
+// actually reached.
+func (h *Handler) coverSources(meta coverMeta) []coverSource {
+	if meta.cacheKind == "" || meta.cacheKey == "" {
+		return nil
+	}
+	var out []coverSource
+
+	// Managed covers skip the guard: the asset store is aether's own directory
+	// under the data dir, so it is outside every scan folder root by construction.
+	if meta.coverPath != "" && (meta.coverManaged || h.mediaPathAllowed(meta.coverPath)) {
+		if info, err := os.Stat(meta.coverPath); err == nil {
+			path := meta.coverPath
+			out = append(out, coverSource{
+				kind: meta.cacheKind,
+				key:  meta.cacheKey,
+				name: "cover",
+				// Fingerprint on *which* file is served plus its size and
+				// mtime, not on age alone: falling back to an older file
+				// (removing an upload uncovers the folder image) must still
+				// invalidate the cached derivative.
+				fingerprint: fmt.Sprintf("file|%s|%d|%d", path, info.Size(), info.ModTime().UnixNano()),
+				load:        func(int) ([]byte, error) { return os.ReadFile(path) }, //nolint:gosec // G304: path comes from the cover resolver, never from the request — either aether's own asset store or a scanner-detected image confined to the scan folder roots by mediaPathAllowed above
+			})
+		}
+	}
+
+	if src, ok := h.embeddedCoverSource(meta); ok {
+		out = append(out, src)
+	}
+
+	if meta.seed != "" {
+		seed := meta.seed
+		title := meta.title
+		style := defaultCoverStyle(seed)
+		out = append(out, coverSource{
+			kind: meta.cacheKind,
+			key:  meta.cacheKey,
+			name: "generated",
+			// The seed-picked style and the title (drawn onto the art) both belong
+			// in the key, so a change to either re-renders rather than serving the
+			// old look.
+			fingerprint: "generated|" + seed + "|" + style + "|" + title,
+			load: func(size int) ([]byte, error) {
+				// Render at the display size so grain lands where it's shown; the
+				// cache's scale to size is then a no-op (see generateCover).
+				return generateCover(seed, style, title, size)
+			},
+		})
+	}
+	return out
+}
+
+// embeddedCoverSource resolves the album's embedded front cover as a cache
+// source, or ok=false when the album has no flagged cover track on disk.
+func (h *Handler) embeddedCoverSource(meta coverMeta) (coverSource, bool) {
+	if meta.albumID == 0 {
+		return coverSource{}, false
+	}
+	trackPath, err := h.store.GetCoverTrackPath(meta.albumID)
+	if err != nil || trackPath == "" {
+		return coverSource{}, false
+	}
+	if !h.mediaPathAllowed(trackPath) {
+		return coverSource{}, false
+	}
+	info, err := os.Stat(trackPath)
+	if err != nil {
+		return coverSource{}, false
+	}
+	albumID := meta.albumID
+	return coverSource{
+		kind: meta.cacheKind,
+		key:  meta.cacheKey,
+		name: "embedded",
+		// Keyed on the audio file so re-tagging it rebuilds the derivative; the
+		// point of caching here is that a hit costs no tag read of a whole music
+		// file at all.
+		fingerprint: fmt.Sprintf("embedded|%s|%d|%d", trackPath, info.Size(), info.ModTime().UnixNano()),
+		load: func(int) ([]byte, error) {
+			data := h.readEmbeddedCover(albumID)
+			if data == nil {
+				return nil, errNoEmbeddedCover
+			}
+			return data, nil
+		},
+	}, true
+}
+
+// errNoEmbeddedCover reports a track flagged as carrying embedded art whose
+// front cover cannot be read after all (re-tagged since the scan).
+var errNoEmbeddedCover = errors.New("track has no embedded front cover")
+
+// coverGen is the Generator over covergen's full built-in style set, used both
+// to render the name-seeded fallback cover and to validate a configured style
+// name.
+var coverGen = allstyles.New()
+
+// coverFonts is covergen's embedded OFL font set, parsed once at startup. It is
+// the FontProvider handed to GenerateWithText so a generated cover can caption
+// itself with the entity's name; without it the overlay renders textless.
+var coverFonts = fonts.Default()
+
+// coverStyleNames returns g's style names in canonical order.
+func coverStyleNames(g *covergen.Generator) []string {
+	styles := g.Styles()
+	names := make([]string, 0, len(styles))
+	for _, s := range styles {
+		names = append(names, s.Name())
+	}
+	return names
+}
+
+// defaultCoverStyle picks the covergen style for an entity's generated cover,
+// deterministically by seed, over the full built-in style set.
+func defaultCoverStyle(seed string) string {
+	if s := coverGen.StyleFor(seed); s != nil {
+		return s.Name()
+	}
+	return "auto"
+}
+
+// generateCover renders a generated cover at the requested display size,
+// captioned with title (an empty title renders the textless art). Rendering at
+// the output size — rather than one large master the cache downscales — keeps
+// film grain and fine detail at the size actually shown, matching the lab.
+func generateCover(seed, style, title string, size int) ([]byte, error) {
+	st, ok := coverGen.ByName(style)
+	if !ok {
+		// "auto"/unknown resolves to the seed-picked style, matching Generate.
+		st = coverGen.StyleFor(seed)
+	}
+	if st == nil {
+		return coverGen.Generate(seed, size)
+	}
+	return coverGen.GenerateWithText(seed, size, st, nil, covergen.Text{Main: title}, coverFonts)
+}
+
+// serveETaggedFile serves path with an ETag identifying that exact file, and no
+// Last-Modified. Cover and stream URLs are stable while the file behind them is
+// not — and the replacement is not always newer (removing an uploaded image
+// falls back to an older folder image; a rescan reassigns a track ID to an older
+// file), so a date-based validator can wrongly answer 304 and pin a stale
+// image or song in the browser until a hard refresh.
+func serveETaggedFile(w http.ResponseWriter, r *http.Request, path string, info os.FileInfo) {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano())))
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:16])+`"`)
+
+	f, err := os.Open(path) //nolint:gosec // G304: path is never request-supplied (cover resolver, imagecache derivative, or a track path), and DB-sourced paths are confined to the scan folder roots by mediaPathAllowed before reaching here
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	// A zero modtime tells ServeContent to omit Last-Modified, leaving the ETag
+	// as the only validator. ServeContent still handles If-None-Match and Range.
+	http.ServeContent(w, r, filepath.Base(path), time.Time{}, f)
+}
+
+// maxCoverSize is the largest edge the server will serve, and what a request
+// with no size gets. Originals are never served as-is: a 3000px scan behind an
+// unsized request is exactly the traffic this cache exists to avoid.
+const maxCoverSize = 1024
+
+// coverSizeBuckets are the sizes derivatives are actually built at. Quantizing
+// bounds the cache to a handful of files per entity instead of one per distinct
+// size any client ever asks for. The small buckets match what the web UI
+// requests (48/80/96/160/200/250 across rows, cards and the player).
+var coverSizeBuckets = []int{48, 96, 160, 256, 512, maxCoverSize}
+
+// quantizeCoverSize rounds the requested size up to the nearest bucket, so a
+// client asking for 200 gets the 256 derivative scaled down by the browser
+// rather than its own cache entry. Oversized and non-positive values clamp to
+// the cap.
+func quantizeCoverSize(requested int) int {
+	if requested <= 0 {
+		return maxCoverSize
+	}
+	for _, b := range coverSizeBuckets {
+		if requested <= b {
+			return b
+		}
+	}
+	return maxCoverSize
+}
+
+// readEmbeddedCover returns the album's embedded front cover, or nil when the
+// flagged track has none. Only the picture typed "Front Cover" is a cover: a
+// file may also embed a back cover, disc scan or booklet page, and those must
+// never be served as the album art.
+func (h *Handler) readEmbeddedCover(albumID uint) []byte {
+	trackPath, err := h.store.GetCoverTrackPath(albumID)
+	if err != nil || trackPath == "" {
+		return nil
+	}
+	data, ok, err := tags.ReadFrontCover(trackPath)
+	if err != nil || !ok {
+		return nil
+	}
+	return data
+}

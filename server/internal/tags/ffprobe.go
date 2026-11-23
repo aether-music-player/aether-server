@@ -1,0 +1,150 @@
+// internal/tags/ffprobe.go
+package tags
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// FFProbeTimeout bounds a single ffprobe invocation. Cancellation alone is not
+// enough: a scheduled scan has nobody to cancel it, so a file that makes ffprobe
+// wedge (a malformed container, an unresponsive network mount) would hang a scan
+// worker for the lifetime of the process. Generous enough for a tag read from
+// spinning rust or NFS — this is a safety net for pathological files, not a
+// tuning knob.
+const FFProbeTimeout = 30 * time.Second
+
+var ffprobeExtensions = map[string]bool{
+	".mp3": true, ".flac": true, ".ogg": true, ".opus": true, ".m4a": true, ".m4b": true, ".mp4": true,
+	".aac": true, ".wma": true, ".wav": true, ".wv": true, ".ape": true, ".aiff": true,
+	".mka": true, ".mpc": true, ".oga": true, ".tak": true, ".tta": true, ".dsf": true,
+	".webm": true, ".spx": true, ".w64": true, ".rf64": true,
+}
+
+type FFProbeReader struct{}
+
+func (FFProbeReader) CanRead(absPath string) bool {
+	return ffprobeExtensions[strings.ToLower(filepath.Ext(absPath))]
+}
+
+func (FFProbeReader) Read(ctx context.Context, absPath string) (Metadata, error) {
+	// Derived from the caller's context, so the read ends on whichever comes
+	// first: the caller giving up, or FFProbeTimeout catching a wedged process.
+	ctx, cancel := context.WithTimeout(ctx, FFProbeTimeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, //nolint:gosec // G204: args are passed directly without a shell; absPath is a scanned file under a scan folder
+		"ffprobe", "-hide_banner", "-v", "0", "-i", absPath,
+		// The attached picture's type only shows up in the stream's "comment"
+		// tag, and its disposition tells a cover apart from a real video
+		// stream — both are needed to accept only front covers as cover art.
+		"-show_entries", "format:stream=codec_type:stream_tags=comment:stream_disposition=attached_pic",
+		"-of", "json",
+	).Output()
+	if err != nil {
+		// A killed process reports a generic "signal: killed"; the context says
+		// why, which is the difference between "this file is broken" and "we gave
+		// up on it" in a scan's error list.
+		if ctx.Err() != nil {
+			return Metadata{}, fmt.Errorf("ffprobe %q: %w", absPath, ctx.Err())
+		}
+		return Metadata{}, fmt.Errorf("ffprobe exec: %w", err)
+	}
+	return parseFFProbeJSON(out)
+}
+
+// parseFFProbeJSON maps the JSON produced by `ffprobe ... -of json` into
+// Metadata. It is kept separate from the exec call above so the parsing logic
+// can be unit-tested without the ffprobe binary present.
+func parseFFProbeJSON(out []byte) (Metadata, error) {
+	var d struct {
+		Streams []struct {
+			CodecType   string `json:"codec_type"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
+			Tags struct {
+				Comment string `json:"comment"`
+			} `json:"tags"`
+		} `json:"streams"`
+		Format struct {
+			Duration string            `json:"duration"`
+			BitRate  string            `json:"bit_rate"`
+			Tags     map[string]string `json:"tags"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(out, &d); err != nil {
+		return Metadata{}, fmt.Errorf("ffprobe json: %w", err)
+	}
+
+	durSecs, _ := strconv.ParseFloat(d.Format.Duration, 64)
+	bitrate, _ := strconv.Atoi(d.Format.BitRate)
+
+	tags := make(map[string][]string, len(d.Format.Tags))
+	for k, v := range d.Format.Tags {
+		tags[k] = []string{v}
+	}
+
+	// Only an attached picture typed as a front cover counts as cover art: a
+	// back cover, disc scan or booklet page must never be served as one.
+	var hasCover bool
+	for _, s := range d.Streams {
+		if s.CodecType == "video" && s.Disposition.AttachedPic == 1 && isFrontCoverComment(s.Tags.Comment) {
+			hasCover = true
+			break
+		}
+	}
+
+	m := Metadata{
+		Duration: time.Duration(durSecs) * time.Second,
+		Bitrate:  bitrate / 1000,
+		HasCover: hasCover,
+	}
+	m.Title = first(tags, "title", "TITLE")
+	m.Artist = splitSemicolon(first(tags, "artist", "ARTIST"))
+	m.AlbumArtist = splitSemicolon(first(tags, "album_artist", "ALBUMARTIST"))
+	m.Album = first(tags, "album", "ALBUM")
+	m.Genre = splitSemicolon(first(tags, "genre", "GENRE"))
+	m.Year = parseYear(tags)
+	m.TrackNumber = parseInt(first(tags, "track", "TRACK"))
+	m.DiscNumber = parseInt(first(tags, "disc", "DISC"))
+	m.DiscSubtitle = first(tags, "TSST", "discsubtitle")
+	m.MBRecordingID = first(tags, "musicbrainz_trackid", "MUSICBRAINZ_TRACKID", "MusicBrainz Release Track Id")
+	m.MBReleaseID = first(tags, "musicbrainz_albumid", "MUSICBRAINZ_ALBUMID", "MusicBrainz Album Id")
+	m.MBReleaseGroupID = first(tags, "musicbrainz_releasegroupid", "MUSICBRAINZ_RELEASEGROUPID", "MusicBrainz Release Group Id")
+	m.MBArtistID = allOrSingle(tags, "musicbrainz_artistid", "MUSICBRAINZ_ARTISTID", "MusicBrainz Artist Id")
+	m.MBAlbumArtistID = allOrSingle(tags, "musicbrainz_albumartistid", "MUSICBRAINZ_ALBUMARTISTID", "MusicBrainz Album Artist Id")
+	m.Lyrics = first(tags, "lyrics", "LYRICS")
+	m.Grouping = strings.TrimSpace(first(tags, "grouping", "GROUPING"))
+	m.Compilation = parseBool(first(tags, "compilation", "COMPILATION"))
+	m.ReleaseTypes = allOrSingle(tags, "RELEASETYPE", "releasetype", "MusicBrainz Album Type", "MUSICBRAINZ ALBUM TYPE",
+		"MUSICBRAINZ_ALBUMTYPE", "musicbrainz_albumtype")
+	m.ReplayGain = ReplayGain{
+		TrackGain: parseDBPtr(first(tags, "replaygain_track_gain", "REPLAYGAIN_TRACK_GAIN")),
+		TrackPeak: parseFloatPtr(first(tags, "replaygain_track_peak", "REPLAYGAIN_TRACK_PEAK")),
+		AlbumGain: parseDBPtr(first(tags, "replaygain_album_gain", "REPLAYGAIN_ALBUM_GAIN")),
+		AlbumPeak: parseFloatPtr(first(tags, "replaygain_album_peak", "REPLAYGAIN_ALBUM_PEAK")),
+	}
+	return m, nil
+}
+
+func splitSemicolon(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}

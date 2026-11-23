@@ -1,0 +1,477 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { ref, markRaw } from 'vue'
+import PrimeVue from 'primevue/config'
+import FileUpload from 'primevue/fileupload'
+
+const album = {
+    id: 'al1',
+    name: 'Album One',
+    artist: 'The Artist',
+    coverArt: 'ca1',
+    song: [
+        { id: 's1', title: 'One' },
+        { id: 's2', title: 'Two' }
+    ]
+}
+
+// Mutable ref so individual tests can swap in a multi-disc album.
+const albumData = ref<unknown>(markRaw(album))
+const albumError = ref<unknown>(null)
+
+const isTouch = ref(false)
+vi.mock('@/composables/useViewport', () => ({
+    useViewport: () => ({ isTouch, tier: ref('desktop'), shell: ref('classic') })
+}))
+
+const toggleStarMutate = vi.fn()
+const updateCoverMutate = vi.fn()
+const updateCoverIsPending = ref(false)
+vi.mock('@/composables/useSubsonicQueries', () => ({
+    useAlbum: () => ({ data: albumData, isLoading: ref(false), error: albumError }),
+    useToggleStar: () => ({ mutate: toggleStarMutate }),
+    useUpdateAlbumCover: () => ({ mutate: updateCoverMutate, isPending: updateCoverIsPending })
+}))
+
+const start = vi.fn()
+const end = vi.fn()
+vi.mock('@/composables/useAlbumDrag', () => ({
+    useAlbumDrag: () => ({ start, end })
+}))
+
+const songsStart = vi.fn()
+const songsEnd = vi.fn()
+vi.mock('@/composables/useSongsDrag', () => ({
+    useSongsDrag: () => ({ start: songsStart, end: songsEnd })
+}))
+
+const playAlbum = vi.fn()
+const addMultipleToQueue = vi.fn()
+const enqueueAndPlayIfIdle = vi.fn()
+const playNow = vi.fn()
+vi.mock('@/composables/usePlayer', () => ({
+    usePlayer: () => ({
+        playAlbum,
+        addMultipleToQueue,
+        enqueueAndPlayIfIdle,
+        playNow,
+        currentTrack: ref(null)
+    })
+}))
+
+const isAdmin = ref(true)
+vi.mock('@/composables/useAuth', () => ({
+    useAuth: () => ({ isAdmin })
+}))
+
+const mockGetGeneratedCoverPreviewUrl = vi.fn()
+vi.mock('@/lib/api/subsonic', () => ({
+    subsonicClient: {
+        isConfigured: () => true,
+        getCoverArtUrl: (art: string, size: number) => `cover:${art}:${size}`,
+        getGeneratedCoverPreviewUrl: (...args: unknown[]) => mockGetGeneratedCoverPreviewUrl(...args)
+    }
+}))
+
+vi.mock('vue-router', () => ({
+    useRouter: () => ({ back: vi.fn() }),
+    onBeforeRouteLeave: vi.fn()
+}))
+
+vi.mock('primevue/useconfirm', () => ({
+    useConfirm: () => ({ require: (opts: { accept: () => void }) => opts.accept() })
+}))
+
+import AlbumView from '@/views/AlbumView.vue'
+import HeroHeader from '@/components/layout/HeroHeader.vue'
+import { resetCoverVersions } from '@/composables/useCoverVersion'
+import { NETWORK_MESSAGE } from '@/lib/apiError'
+
+const mountView = () =>
+    mount(AlbumView, {
+        props: { id: 'al1' },
+        global: {
+            plugins: [PrimeVue],
+            directives: { tooltip: {} },
+            stubs: {
+                RouterLink: true,
+                TrackActionSheet: {
+                    name: 'TrackActionSheet',
+                    props: ['song', 'visible'],
+                    template: '<div />'
+                },
+                // Owns its own PrimeVue Toast + playlist queries; stubbed here so
+                // selecting a row doesn't drag those into this view's harness.
+                HeroSelectionBar: {
+                    name: 'HeroSelectionBar',
+                    props: ['count', 'songs'],
+                    template: '<div class="hero-selection-bar-stub" />'
+                },
+                GenerateCoverDialog: {
+                    name: 'GenerateCoverDialog',
+                    props: ['visible', 'entityId', 'title'],
+                    emits: ['update:visible', 'select'],
+                    template: '<div class="generate-cover-dialog-stub" />'
+                }
+            }
+        }
+    })
+
+beforeEach(() => {
+    albumData.value = markRaw(album)
+    albumError.value = null
+    isTouch.value = false
+    playAlbum.mockClear()
+    addMultipleToQueue.mockClear()
+    enqueueAndPlayIfIdle.mockClear()
+    playNow.mockClear()
+    toggleStarMutate.mockClear()
+    songsStart.mockClear()
+    songsEnd.mockClear()
+    updateCoverMutate.mockClear()
+    updateCoverIsPending.value = false
+    isAdmin.value = true
+    resetCoverVersions()
+    global.URL.createObjectURL = vi.fn(() => 'blob:mock')
+    global.URL.revokeObjectURL = vi.fn()
+    mockGetGeneratedCoverPreviewUrl.mockClear()
+    mockGetGeneratedCoverPreviewUrl.mockReturnValue('generated:preview')
+})
+
+// In the desktop app a request that got no answer rejects with the HTTP plugin's
+// bare string, which names the request URL, apiKey included. The page must say
+// what happened, and nothing of that string.
+describe('AlbumView when the album cannot be loaded', () => {
+    it('says the server could not be reached, without the transport text', () => {
+        albumData.value = undefined
+        albumError.value =
+            'error sending request for url (http://h:8075/rest/getAlbum.view?apiKey=aether_s3cret)'
+
+        const w = mountView()
+
+        expect(w.find('.error').text()).toBe(NETWORK_MESSAGE)
+    })
+})
+
+describe('AlbumView hero eyebrow', () => {
+    const eyebrow = (w: ReturnType<typeof mountView>) => w.find('.detail-hero .eyebrow').text()
+
+    it('falls back to "Album" when no release type is set', () => {
+        expect(eyebrow(mountView())).toBe('Album')
+    })
+
+    it('shows the release types when set', () => {
+        albumData.value = markRaw({ ...album, releaseTypes: ['album', 'soundtrack'] })
+        expect(eyebrow(mountView())).toBe('Album · Soundtrack')
+        albumData.value = markRaw({ ...album, releaseTypes: ['EP'] })
+        expect(eyebrow(mountView())).toBe('EP')
+    })
+})
+
+describe('AlbumView grouping link', () => {
+    const link = (w: ReturnType<typeof mountView>) => w.find('[data-test="album-grouping-link"]')
+
+    it('is absent for an album without a grouping', () => {
+        expect(link(mountView()).exists()).toBe(false)
+    })
+
+    it('names the grouping and links to its page', () => {
+        albumData.value = markRaw({ ...album, grouping: { id: 'gr-4', name: 'Doctor Who' } })
+        const w = mountView()
+        expect(link(w).exists()).toBe(true)
+        // RouterLink is stubbed (no slot content); the link is there and has a target.
+        expect(link(w).attributes('to')).toBeTruthy()
+    })
+})
+
+describe('AlbumView album drag', () => {
+    it('makes the hero cover a drag source', () => {
+        const w = mountView()
+        const cover = w.find('.flip-front')
+        expect(cover.exists()).toBe(true)
+        expect(cover.attributes('draggable')).toBe('true')
+    })
+
+    it('starts the album drag with the album and cover URL when the cover is dragged', async () => {
+        const w = mountView()
+        await w.find('.flip-front').trigger('dragstart')
+        expect(start).toHaveBeenCalledTimes(1)
+        const call = start.mock.calls[0]
+        expect(call[1]).toBe(album)
+        expect(call[2]).toBe('cover:ca1:250')
+    })
+})
+
+describe('AlbumView disc grouping', () => {
+    const multiDiscAlbum = {
+        id: 'al2',
+        name: 'Double Album',
+        artist: 'The Artist',
+        coverArt: 'ca2',
+        song: [
+            { id: 'd1t1', title: 'D1 One', discNumber: 1 },
+            { id: 'd1t2', title: 'D1 Two', discNumber: 1 },
+            { id: 'd2t1', title: 'D2 One', discNumber: 2 }
+        ]
+    }
+
+    it('renders column headers above the track list', () => {
+        const w = mountView()
+        const header = w.find('.track-list-header')
+        expect(header.exists()).toBe(true)
+        expect(header.text()).toContain('Title')
+        expect(header.text()).toContain('Artist')
+        // The duration column header is a clock icon (labelled for a11y).
+        expect(header.find('.ms-schedule').exists()).toBe(true)
+    })
+
+    it('renders no disc header for a single-disc album', () => {
+        const w = mountView()
+        expect(w.findAll('.disc-header')).toHaveLength(0)
+        expect(w.findAll('.album-track-row')).toHaveLength(2)
+    })
+
+    it('renders a disc header per disc for a multi-disc album', () => {
+        albumData.value = markRaw(multiDiscAlbum)
+        const w = mountView()
+        const headers = w.findAll('.disc-header')
+        expect(headers).toHaveLength(2)
+        expect(headers[0].text()).toBe('Disc 1')
+        expect(headers[1].text()).toBe('Disc 2')
+        expect(w.findAll('.album-track-row')).toHaveLength(3)
+    })
+
+    it('enqueues the track at the correct flat index when a disc-2 track is double-clicked', async () => {
+        albumData.value = markRaw(multiDiscAlbum)
+        const w = mountView()
+        // Rows are ordered by disc; the 3rd (index 2) is disc 2's first track.
+        const rows = w.findAll('.album-track-row')
+        expect(rows).toHaveLength(3)
+        await rows[2].trigger('dblclick')
+        expect(enqueueAndPlayIfIdle).toHaveBeenCalledWith([multiDiscAlbum.song[2]])
+        // Double-click appends — it must never replace the queue.
+        expect(playAlbum).not.toHaveBeenCalled()
+    })
+})
+
+describe('AlbumView song selection and drag', () => {
+    it('highlights a row on click and carries it on dragstart', async () => {
+        const w = mountView()
+        const rows = w.findAll('.album-track-row')
+        await rows[0].trigger('click')
+        expect(rows[0].classes()).toContain('selected')
+
+        await rows[0].trigger('dragstart')
+        expect(songsStart).toHaveBeenCalledTimes(1)
+        expect(songsStart.mock.calls[0][1]).toEqual([album.song[0]])
+    })
+
+    it('drags the whole multi-selection when a selected row is grabbed', async () => {
+        const w = mountView()
+        const rows = w.findAll('.album-track-row')
+        await rows[0].trigger('click')
+        // Ctrl-click adds the second row to the selection.
+        await rows[1].trigger('click', { ctrlKey: true })
+
+        await rows[1].trigger('dragstart')
+        expect(songsStart.mock.calls[0][1]).toEqual([album.song[0], album.song[1]])
+    })
+
+    it('ends the songs drag on dragend', async () => {
+        const w = mountView()
+        await w.findAll('.album-track-row')[0].trigger('dragend')
+        expect(songsEnd).toHaveBeenCalledTimes(1)
+    })
+})
+
+describe('AlbumView hero actions', () => {
+    it('Play in the hero plays the album', async () => {
+        const w = mountView()
+        await w.find('.hero-action-play').trigger('click')
+        expect(playAlbum).toHaveBeenCalledWith(album.song)
+    })
+
+    it('Add to queue in the hero enqueues the album songs', async () => {
+        const w = mountView()
+        await w.find('.hero-action-queue').trigger('click')
+        expect(addMultipleToQueue).toHaveBeenCalledWith(album.song)
+    })
+
+    it('Star in the hero toggles the album star', async () => {
+        const w = mountView()
+        await w.find('.hero-action-star').trigger('click')
+        expect(toggleStarMutate).toHaveBeenCalledWith({ id: 'al1', starred: false })
+    })
+
+    it('leaves the top bar Back-only; play lives in the hero', () => {
+        const w = mountView()
+        // The album drag moved onto the cover, so the top bar has no drag handle.
+        expect(w.find('.album-drag-handle').exists()).toBe(false)
+        // Hero owns play/queue/star now; they render inside the HeroHeader.
+        expect(w.find('.hero-header .hero-action-play').exists()).toBe(true)
+    })
+})
+
+describe('AlbumView track favorites', () => {
+    it('gives every track row its own favorite toggle', () => {
+        const w = mountView()
+        expect(w.findAll('.album-track-row .row-star')).toHaveLength(2)
+    })
+
+    // The hero star is the ALBUM's; a row star is that track's. Sharing a mutation
+    // makes it easy to send the wrong id, so this pins the distinction.
+    it('a row heart stars the track, not the album', async () => {
+        const w = mountView()
+        await w.findAll('.album-track-row .row-star')[1].trigger('click')
+        expect(toggleStarMutate).toHaveBeenCalledWith({ id: 's2', starred: false })
+    })
+
+    it('the star column has a header cell so rows stay aligned', () => {
+        const w = mountView()
+        expect(w.find('.track-list-header .col-star').exists()).toBe(true)
+    })
+})
+
+describe('AlbumView touch interactions', () => {
+    // A tap must queue the whole VISIBLE list and start at the tapped track — the
+    // touch counterpart of the hero Play. `playNow` would set queue=[song], so
+    // tapping track 2 used to discard track 1 and everything already queued.
+    it('tapping a row queues the album and starts at that track', async () => {
+        isTouch.value = true
+        const w = mountView()
+        await w.findAll('.album-track-row')[1].trigger('click')
+        expect(playAlbum).toHaveBeenCalledWith(album.song, 1)
+        expect(playNow).not.toHaveBeenCalled()
+    })
+
+    // The queued list is the flat disc-ordered list, so the start index is the
+    // row's position in it — not its position within its own disc.
+    it('starts at the tapped track flat index across discs', async () => {
+        const multiDiscAlbum = {
+            id: 'al2',
+            name: 'Double Album',
+            artist: 'The Artist',
+            song: [
+                { id: 'd1t1', title: 'D1 One', discNumber: 1 },
+                { id: 'd1t2', title: 'D1 Two', discNumber: 1 },
+                { id: 'd2t1', title: 'D2 One', discNumber: 2 }
+            ]
+        }
+        albumData.value = markRaw(multiDiscAlbum)
+        isTouch.value = true
+        const w = mountView()
+        await w.findAll('.album-track-row')[2].trigger('click')
+        expect(playAlbum).toHaveBeenCalledWith(multiDiscAlbum.song, 2)
+    })
+
+    it('opens the action sheet from ⋮', async () => {
+        isTouch.value = true
+        const w = mountView()
+        await w.findAll('[aria-label="Track actions"]')[0].trigger('click')
+        expect(w.findComponent({ name: 'TrackActionSheet' }).props('visible')).toBe(true)
+        // The ⋮ is not a play affordance.
+        expect(playAlbum).not.toHaveBeenCalled()
+    })
+})
+
+describe('AlbumView cover editing', () => {
+    const enterEdit = async (w: ReturnType<typeof mountView>) => {
+        await w.find('.edit-action-edit').trigger('click')
+    }
+
+    it('offers an editable hero cover for admins', () => {
+        const w = mountView()
+        expect(w.find('.edit-action-edit').exists()).toBe(true)
+    })
+
+    it('hides the edit action bar from non-admins', () => {
+        isAdmin.value = false
+        const w = mountView()
+        expect(w.find('.edit-action-edit').exists()).toBe(false)
+    })
+
+    it('save is disabled until an image is staged', async () => {
+        const w = mountView()
+        await enterEdit(w)
+        const save = w.find('.edit-action-save')
+        expect(save.attributes('disabled')).toBeDefined()
+
+        const file = new File(['test'], 'cover.png', { type: 'image/png' })
+        w.findComponent(FileUpload).vm.$emit('select', { files: [file] })
+        await flushPromises()
+        expect(w.find('.edit-action-save').attributes('disabled')).toBeUndefined()
+    })
+
+    it('uploads the staged file through updateAlbumCover', async () => {
+        const w = mountView()
+        const file = new File(['test'], 'cover.png', { type: 'image/png' })
+        w.findComponent(FileUpload).vm.$emit('select', { files: [file] })
+        await flushPromises()
+
+        await enterEdit(w)
+        await w.find('.edit-action-save').trigger('click')
+        expect(updateCoverMutate).toHaveBeenCalledWith(
+            { albumId: 'al1', coverFile: file, coverClear: undefined },
+            expect.anything()
+        )
+    })
+
+    it('clears the cover through coverClear', async () => {
+        const w = mountView()
+        w.findComponent(HeroHeader).vm.$emit('cover-remove')
+        await flushPromises()
+
+        await enterEdit(w)
+        await w.find('.edit-action-save').trigger('click')
+        expect(updateCoverMutate).toHaveBeenCalledWith(
+            { albumId: 'al1', coverFile: undefined, coverClear: true },
+            expect.anything()
+        )
+    })
+
+    it('rejects a file over the 5 MB cap without staging it', async () => {
+        const w = mountView()
+        const big = new File([new Uint8Array(6 * 1024 * 1024)], 'big.png', { type: 'image/png' })
+        w.findComponent(FileUpload).vm.$emit('select', { files: [big] })
+        await flushPromises()
+
+        await enterEdit(w)
+        expect(w.find('.edit-action-save').attributes('disabled')).toBeDefined()
+    })
+
+    it('shows Generate button in edit mode and passes pick to mutation', async () => {
+        const w = mountView()
+        await enterEdit(w)
+
+        const generateBtn = w.find('button[aria-label="Generate"]')
+        expect(generateBtn.exists()).toBe(true)
+
+        await generateBtn.trigger('click')
+        await flushPromises()
+
+        const dialog = w.findComponent({ name: 'GenerateCoverDialog' })
+        expect(dialog.props('visible')).toBe(true)
+        expect(dialog.props('entityId')).toBe('al1')
+
+        dialog.vm.$emit('select', { style: 'bauhaus', variation: 3 })
+        await flushPromises()
+
+        expect(mockGetGeneratedCoverPreviewUrl).toHaveBeenCalledWith({
+            id: 'al1',
+            style: 'bauhaus',
+            variation: 3,
+            size: 512
+        })
+
+        await w.find('.edit-action-save').trigger('click')
+        expect(updateCoverMutate).toHaveBeenCalledWith(
+            {
+                albumId: 'al1',
+                coverFile: undefined,
+                coverClear: undefined,
+                generate: { style: 'bauhaus', variation: 3 }
+            },
+            expect.anything()
+        )
+    })
+})

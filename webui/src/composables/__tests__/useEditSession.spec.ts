@@ -1,0 +1,1318 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { nextTick, ref } from 'vue'
+import { albumKey } from '@/lib/albumIdentity'
+import {
+    albumPickToOverlay,
+    applyOverlay,
+    buildTrackPatch,
+    candidateToOverlay,
+    groupPatches,
+    originalValueEquals,
+    trackCredits,
+    useEditSession
+} from '@/composables/useEditSession'
+import type {
+    AlbumIdentifyPick,
+    AlbumOption,
+    IdentifyCandidate,
+    Track,
+    TrackOverlay
+} from '@/types/metadata'
+
+// The session composable calls useApplyPicture()/useDeletePicture() plus the
+// query client and toast at setup; keep the real pure helpers but stub the
+// side-effecting pieces so no vue-query/toast providers are needed.
+const updateTracksSpy = vi.hoisted(() => vi.fn())
+const applyPictureSpy = vi.hoisted(() => vi.fn())
+const deletePictureSpy = vi.hoisted(() => vi.fn())
+const applyArtistImageSpy = vi.hoisted(() => vi.fn())
+const deleteArtistImageSpy = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/api/Metadata', () => ({
+    updateTracks: (...args: unknown[]) => updateTracksSpy(...args),
+    applyArtistImage: (...args: unknown[]) => applyArtistImageSpy(...args),
+    deleteArtistImage: (...args: unknown[]) => deleteArtistImageSpy(...args)
+}))
+vi.mock('@/composables/useMetadataEditor', async (importActual) => {
+    const actual = await importActual<typeof import('@/composables/useMetadataEditor')>()
+    return {
+        ...actual,
+        useApplyPicture: () => ({ mutateAsync: applyPictureSpy }),
+        useDeletePicture: () => ({ mutateAsync: deletePictureSpy })
+    }
+})
+// save() polls every write's reindex job in one batch at the end; the
+// mutations/raw API calls above are mocked separately and only ever hand back
+// the write result (with its `reindex` ref) for save() to collect.
+const pollReindexSpy = vi.hoisted(() => vi.fn())
+vi.mock('@/composables/useReindexPolling', () => ({
+    pollReindex: (...args: unknown[]) => pollReindexSpy(...args)
+}))
+const invalidateSpy = vi.hoisted(() => vi.fn())
+vi.mock('@tanstack/vue-query', async (importActual) => {
+    const actual = await importActual<typeof import('@tanstack/vue-query')>()
+    return {
+        ...actual,
+        useQueryClient: () => ({ invalidateQueries: invalidateSpy })
+    }
+})
+const toastAddSpy = vi.hoisted(() => vi.fn())
+vi.mock('primevue/usetoast', () => ({
+    useToast: () => ({ add: toastAddSpy })
+}))
+
+const mkTrack = (over: Partial<Track> = {}): Track => ({
+    path: 'a.mp3',
+    name: 'a.mp3',
+    title: '',
+    artists: [],
+    album_artists: [],
+    album: '',
+    genres: [],
+    release_types: [],
+    year: 0,
+    track_number: 0,
+    disc_number: 0,
+    disc_subtitle: '', grouping: '',
+    compilation: false,
+    mb_artist_ids: [],
+    mb_album_artist_ids: [],
+    mb_recording_id: '',
+    mb_release_id: '',
+    mb_release_group_id: '',
+    ...over
+})
+
+describe('trackCredits', () => {
+    it('aligns names with their mbids', () => {
+        const t = mkTrack({ artists: ['One', 'Two'], mb_artist_ids: ['id1'] })
+        expect(trackCredits(t, 'artists')).toEqual([
+            { name: 'One', mbid: 'id1' },
+            { name: 'Two', mbid: '' }
+        ])
+    })
+})
+
+describe('applyOverlay', () => {
+    it('returns the track unchanged without an overlay', () => {
+        const t = mkTrack({ title: 'Original' })
+        expect(applyOverlay(t, undefined)).toBe(t)
+    })
+
+    it('overrides staged scalars and keeps the rest', () => {
+        const t = mkTrack({ title: 'Original', album: 'Album', year: 1990 })
+        const out = applyOverlay(t, { title: 'Staged', year: 2000 })
+        expect(out.title).toBe('Staged')
+        expect(out.year).toBe(2000)
+        expect(out.album).toBe('Album')
+    })
+
+    it('expands artist credits into aligned names and ids', () => {
+        const t = mkTrack({ artists: ['Old'], mb_artist_ids: ['old-id'] })
+        const out = applyOverlay(t, {
+            artists: [
+                { name: 'New', mbid: 'new-id' },
+                { name: 'Feat', mbid: '' }
+            ]
+        })
+        expect(out.artists).toEqual(['New', 'Feat'])
+        expect(out.mb_artist_ids).toEqual(['new-id', ''])
+    })
+
+    it('supports falsy staged values (empty string, zero, false)', () => {
+        const t = mkTrack({ title: 'X', year: 1990, compilation: true })
+        const out = applyOverlay(t, { title: '', year: 0, compilation: false })
+        expect(out.title).toBe('')
+        expect(out.year).toBe(0)
+        expect(out.compilation).toBe(false)
+    })
+
+    it('overlays grouping, including a staged clear', () => {
+        const t = mkTrack({ grouping: 'Old' })
+        expect(applyOverlay(t, { grouping: 'New' }).grouping).toBe('New')
+        expect(applyOverlay(t, { grouping: '' }).grouping).toBe('')
+        expect(applyOverlay(t, { title: 'x' }).grouping).toBe('Old')
+    })
+
+    it('overrides genres and track number', () => {
+        const t = mkTrack({ genres: ['Rock'], track_number: 1 })
+        const out = applyOverlay(t, { genres: ['Jazz', 'Blues'], track_number: 9 })
+        expect(out.genres).toEqual(['Jazz', 'Blues'])
+        expect(out.track_number).toBe(9)
+        // The staged list must not be aliased into the effective track.
+        out.genres.push('Mutated')
+        expect(t.genres).toEqual(['Rock'])
+    })
+
+    it('overrides release types without aliasing the staged list', () => {
+        const t = mkTrack({ release_types: ['Album'] })
+        const out = applyOverlay(t, { release_types: ['Album', 'Compilation'] })
+        expect(out.release_types).toEqual(['Album', 'Compilation'])
+        out.release_types.push('Mutated')
+        expect(t.release_types).toEqual(['Album'])
+    })
+})
+
+describe('originalValueEquals', () => {
+    it('compares scalars', () => {
+        const t = mkTrack({ title: 'Same' })
+        expect(originalValueEquals(t, 'title', 'Same')).toBe(true)
+        expect(originalValueEquals(t, 'title', 'Other')).toBe(false)
+    })
+
+    it('compares credit lists by name and mbid', () => {
+        const t = mkTrack({ artists: ['A'], mb_artist_ids: ['id'] })
+        expect(originalValueEquals(t, 'artists', [{ name: 'A', mbid: 'id' }])).toBe(true)
+        expect(originalValueEquals(t, 'artists', [{ name: 'A', mbid: 'other' }])).toBe(false)
+        expect(originalValueEquals(t, 'artists', [])).toBe(false)
+    })
+
+    it('compares genre lists element-wise', () => {
+        const t = mkTrack({ genres: ['Rock', 'Jazz'] })
+        expect(originalValueEquals(t, 'genres', ['Rock', 'Jazz'])).toBe(true)
+        expect(originalValueEquals(t, 'genres', ['Jazz', 'Rock'])).toBe(false)
+        expect(originalValueEquals(t, 'genres', [])).toBe(false)
+    })
+
+    it('compares release-type lists element-wise', () => {
+        const t = mkTrack({ release_types: ['Album', 'Compilation'] })
+        expect(originalValueEquals(t, 'release_types', ['Album', 'Compilation'])).toBe(true)
+        expect(originalValueEquals(t, 'release_types', ['Compilation', 'Album'])).toBe(false)
+        expect(originalValueEquals(t, 'release_types', [])).toBe(false)
+    })
+})
+
+describe('buildTrackPatch', () => {
+    it('copies staged scalars verbatim', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            title: 'T',
+            mb_recording_id: 'rec',
+            year: 2001
+        })
+        expect(patch).toEqual({ title: 'T', mb_recording_id: 'rec', year: 2001 })
+    })
+
+    it('sends grouping, including an empty one that clears the tag', () => {
+        expect(buildTrackPatch(mkTrack(), { grouping: 'Saga' })).toEqual({ grouping: 'Saga' })
+        expect(buildTrackPatch(mkTrack({ grouping: 'Saga' }), { grouping: '' })).toEqual({ grouping: '' })
+    })
+
+    it('sends names plus complete mbid map when names changed', () => {
+        const original = mkTrack({ artists: ['Old'], mb_artist_ids: ['old-id'] })
+        const patch = buildTrackPatch(original, {
+            artists: [{ name: 'New', mbid: 'new-id' }]
+        })
+        expect(patch.artists).toEqual(['New'])
+        expect(patch.artist_mbids).toEqual({ New: 'new-id' })
+    })
+
+    it('sends only changed mbids when names are untouched', () => {
+        const original = mkTrack({
+            artists: ['A', 'B'],
+            mb_artist_ids: ['a-id', 'b-id']
+        })
+        const patch = buildTrackPatch(original, {
+            artists: [
+                { name: 'A', mbid: 'a-id' },
+                { name: 'B', mbid: 'b-new' }
+            ]
+        })
+        expect(patch.artists).toBeUndefined()
+        expect(patch.artist_mbids).toEqual({ B: 'b-new' })
+    })
+
+    it('produces an empty patch for a credit list identical to the original', () => {
+        const original = mkTrack({ artists: ['A'], mb_artist_ids: ['a-id'] })
+        const patch = buildTrackPatch(original, {
+            artists: [{ name: 'A', mbid: 'a-id' }]
+        })
+        expect(patch).toEqual({})
+    })
+
+    it('trims and drops empty artist names', () => {
+        const original = mkTrack({ artists: ['Old'] })
+        const patch = buildTrackPatch(original, {
+            artists: [
+                { name: '  New  ', mbid: 'id' },
+                { name: '   ', mbid: 'ignored' }
+            ]
+        })
+        expect(patch.artists).toEqual(['New'])
+        expect(patch.artist_mbids).toEqual({ New: 'id' })
+    })
+
+    it('handles album_artists through the same path', () => {
+        const original = mkTrack({ album_artists: ['Old'] })
+        const patch = buildTrackPatch(original, {
+            album_artists: [{ name: 'New', mbid: 'x' }]
+        })
+        expect(patch.album_artists).toEqual(['New'])
+        expect(patch.album_artist_mbids).toEqual({ New: 'x' })
+    })
+
+    it('copies genres (trimmed, empties dropped) and track number', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            genres: [' Rock ', '', 'Jazz'],
+            track_number: 4
+        })
+        expect(patch.genres).toEqual(['Rock', 'Jazz'])
+        expect(patch.track_number).toBe(4)
+    })
+
+    it('copies release types (trimmed, empties dropped)', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            release_types: [' Album ', '', 'Compilation']
+        })
+        expect(patch.release_types).toEqual(['Album', 'Compilation'])
+    })
+})
+
+describe('groupPatches', () => {
+    it('groups tracks with identical patches into one batch', () => {
+        const originals = new Map([
+            ['a.mp3', mkTrack({ path: 'a.mp3' })],
+            ['b.mp3', mkTrack({ path: 'b.mp3' })]
+        ])
+        const overlays = new Map<string, TrackOverlay>([
+            ['a.mp3', { album: 'Same' }],
+            ['b.mp3', { album: 'Same' }]
+        ])
+        const batches = groupPatches(originals, overlays)
+        expect(batches).toHaveLength(1)
+        expect(batches[0].paths.sort()).toEqual(['a.mp3', 'b.mp3'])
+        expect(batches[0].fields).toEqual({ album: 'Same' })
+    })
+
+    it('splits tracks whose patches differ', () => {
+        const originals = new Map([
+            ['a.mp3', mkTrack({ path: 'a.mp3' })],
+            ['b.mp3', mkTrack({ path: 'b.mp3' })]
+        ])
+        const overlays = new Map<string, TrackOverlay>([
+            ['a.mp3', { title: 'One' }],
+            ['b.mp3', { title: 'Two' }]
+        ])
+        const batches = groupPatches(originals, overlays)
+        expect(batches).toHaveLength(2)
+    })
+
+    it('skips overlays that produce empty patches and unknown paths', () => {
+        const originals = new Map([
+            ['a.mp3', mkTrack({ path: 'a.mp3', artists: ['A'], mb_artist_ids: ['id'] })]
+        ])
+        const overlays = new Map<string, TrackOverlay>([
+            ['a.mp3', { artists: [{ name: 'A', mbid: 'id' }] }],
+            ['gone.mp3', { title: 'X' }]
+        ])
+        expect(groupPatches(originals, overlays)).toHaveLength(0)
+    })
+})
+
+describe('buildTrackPatch raw tags', () => {
+    it('emits raw_tags including delete entries', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            raw: { CUSTOM: ['x'], OLD_JUNK: [] }
+        })
+        expect(patch.raw_tags).toEqual({ CUSTOM: ['x'], OLD_JUNK: [] })
+    })
+
+    it('omits raw_tags for an empty raw map', () => {
+        const patch = buildTrackPatch(mkTrack(), { raw: {} })
+        expect('raw_tags' in patch).toBe(false)
+    })
+
+    it('combines raw and structured edits in one patch', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            title: 'T',
+            raw: { CUSTOM: ['x'] }
+        })
+        expect(patch.title).toBe('T')
+        expect(patch.raw_tags).toEqual({ CUSTOM: ['x'] })
+    })
+
+    it('emits remove_unsupported sorted for stable batch grouping', () => {
+        const patch = buildTrackPatch(mkTrack(), {
+            removeUnsupported: ['PRIV/z', 'GEOB']
+        })
+        expect(patch.remove_unsupported).toEqual(['GEOB', 'PRIV/z'])
+    })
+
+    it('omits remove_unsupported for an empty list', () => {
+        const patch = buildTrackPatch(mkTrack(), { removeUnsupported: [] })
+        expect('remove_unsupported' in patch).toBe(false)
+    })
+})
+
+describe('picture staging', () => {
+    // The album the single-folder tests operate on: these tracks carry no
+    // album tag, so their identity falls back to their directory.
+    const ALBUM = albumKey(mkTrack({ path: 'album/a.mp3' }))
+
+    const mkSession = (tracks: Track[] = [mkTrack({ path: 'album/a.mp3' })], folder = 'Main') =>
+        useEditSession(
+            () => tracks,
+            () => folder
+        )
+
+    beforeEach(() => {
+        updateTracksSpy.mockReset()
+        updateTracksSpy.mockResolvedValue({ results: [{ path: 'album/a.mp3', ok: true }] })
+        applyPictureSpy.mockReset()
+        applyPictureSpy.mockResolvedValue({ ok: true, slot: 'folder', type: 'Back Cover' })
+        deletePictureSpy.mockReset()
+        deletePictureSpy.mockResolvedValue({ ok: true })
+        invalidateSpy.mockReset()
+        toastAddSpy.mockReset()
+        pollReindexSpy.mockReset()
+        pollReindexSpy.mockResolvedValue({ failed: 0, pending: 0 })
+        vi.stubGlobal('URL', {
+            ...URL,
+            createObjectURL: vi.fn(() => 'blob:preview'),
+            revokeObjectURL: vi.fn()
+        })
+    })
+
+    it('stages a set op per type+slot cell and flags unsaved changes', () => {
+        const session = mkSession()
+        expect(session.hasStagedChanges.value).toBe(false)
+        session.stagePictureSet(
+            ALBUM,
+            'Back Cover',
+            'folder',
+            { file: null, imageUrl: 'http://img/x.jpg' },
+            ['album/a.mp3']
+        )
+        expect(session.hasStagedChanges.value).toBe(true)
+        const op = session.getPictureOp(ALBUM, 'Back Cover', 'folder')
+        expect(op).toEqual({
+            kind: 'set',
+            file: null,
+            imageUrl: 'http://img/x.jpg',
+            preview: 'http://img/x.jpg',
+            paths: ['album/a.mp3']
+        })
+        // Other cells stay empty.
+        expect(session.getPictureOp(ALBUM, 'Back Cover', 'embedded')).toBeUndefined()
+        expect(session.getPictureOp(ALBUM, 'Front Cover', 'folder')).toBeUndefined()
+    })
+
+    it('previews an online pick with the thumbnail, keeping the full url for the save', () => {
+        const session = mkSession()
+        session.stagePictureSet(
+            ALBUM,
+            'Back Cover',
+            'folder',
+            { file: null, imageUrl: 'http://img/full.jpg', previewUrl: 'http://img/thumb.jpg' },
+            ['album/a.mp3']
+        )
+        const op = session.getPictureOp(ALBUM, 'Back Cover', 'folder')
+        // The staged preview reuses the thumbnail the picker already loaded; the
+        // full image is only downloaded (server-side) on save.
+        expect(op).toMatchObject({ preview: 'http://img/thumb.jpg', imageUrl: 'http://img/full.jpg' })
+    })
+
+    it('a set op overwrites a staged removal on the same cell and vice versa', () => {
+        const session = mkSession()
+        session.stagePictureRemoval(ALBUM, 'Media', 'folder', ['album/a.mp3'])
+        expect(session.getPictureOp(ALBUM, 'Media', 'folder')).toEqual({
+            kind: 'remove',
+            paths: ['album/a.mp3']
+        })
+        session.stagePictureSet(ALBUM, 'Media', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        expect(session.getPictureOp(ALBUM, 'Media', 'folder')?.kind).toBe('set')
+        session.stagePictureRemoval(ALBUM, 'Media', 'folder', ['album/a.mp3'])
+        expect(session.getPictureOp(ALBUM, 'Media', 'folder')).toEqual({
+            kind: 'remove',
+            paths: ['album/a.mp3']
+        })
+    })
+
+    it('discarding the last op clears the unsaved flag', () => {
+        const session = mkSession()
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        session.discardPictureOp(ALBUM, 'Back Cover', 'folder')
+        expect(session.getPictureOp(ALBUM, 'Back Cover', 'folder')).toBeUndefined()
+        expect(session.hasStagedChanges.value).toBe(false)
+    })
+
+    it('creates and revokes blob previews for file-based ops', () => {
+        const session = mkSession()
+        const file = new File(['x'], 'art.png', { type: 'image/png' })
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file, imageUrl: null }, [
+            'album/a.mp3'
+        ])
+        expect(URL.createObjectURL).toHaveBeenCalledWith(file)
+        expect(session.getPictureOp(ALBUM, 'Back Cover', 'folder')?.kind).toBe('set')
+        session.discardPictureOp(ALBUM, 'Back Cover', 'folder')
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
+    })
+
+    it('save posts one form per set op including type and slot', async () => {
+        const session = mkSession()
+        session.stagePictureSet(
+            ALBUM,
+            'Back Cover',
+            'folder',
+            { file: null, imageUrl: 'http://img/x.jpg' },
+            ['album/a.mp3']
+        )
+        await session.save()
+        expect(applyPictureSpy).toHaveBeenCalledTimes(1)
+        const form = applyPictureSpy.mock.calls[0][0] as FormData
+        expect(form.get('slot')).toBe('folder')
+        expect(form.get('type')).toBe('Back Cover')
+        expect(form.get('image_url')).toBe('http://img/x.jpg')
+        expect(form.getAll('paths')).toEqual(['album/a.mp3'])
+        expect(session.hasStagedChanges.value).toBe(false)
+        expect(session.picturesSavedAt.value).toBeGreaterThan(0)
+    })
+
+    it('save deletes removals, always sending the staged paths', async () => {
+        const session = mkSession()
+        session.stagePictureRemoval(ALBUM, 'Front Cover', 'embedded', ['album/a.mp3'])
+        session.stagePictureRemoval(ALBUM, 'Media', 'folder', ['album/a.mp3'])
+        await session.save()
+        expect(deletePictureSpy).toHaveBeenCalledWith({
+            scanFolder: 'Main',
+            type: 'Front Cover',
+            slot: 'embedded',
+            paths: ['album/a.mp3']
+        })
+        expect(deletePictureSpy).toHaveBeenCalledWith({
+            scanFolder: 'Main',
+            type: 'Media',
+            slot: 'folder',
+            paths: ['album/a.mp3']
+        })
+        expect(session.hasStagedChanges.value).toBe(false)
+    })
+
+    // The image is on disk either way, so a failed re-index must not be silent:
+    // otherwise the album keeps serving the old cover with a green toast.
+    const reindexWarnings = () =>
+        toastAddSpy.mock.calls
+            .map((c) => c[0])
+            .filter((t) => t.summary === 'Saved, but the index was not confirmed updated')
+
+    // The flagship contract this task adds: save() does not poll per-write. It
+    // collects every write's execution id — pictures AND tag batches — and
+    // polls them all in ONE call at the end, only invalidating caches (and
+    // resolving) once that poll settles.
+    it('collects every write\'s execution id and polls them once at the end', async () => {
+        const session = mkSession()
+        applyPictureSpy.mockResolvedValue({
+            ok: true,
+            slot: 'folder',
+            type: 'Back Cover',
+            reindex: { execution_id: 'pic-1' }
+        })
+        updateTracksSpy.mockResolvedValue({
+            results: [{ path: 'album/a.mp3', ok: true }],
+            reindex: { execution_id: 'tag-1' }
+        })
+        let resolvePoll!: (v: { failed: number; pending: number }) => void
+        pollReindexSpy.mockReturnValue(
+            new Promise((resolve) => {
+                resolvePoll = resolve
+            })
+        )
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        session.stageField(['album/a.mp3'], 'title', 'New')
+
+        let resolved = false
+        const done = session.save().then(() => {
+            resolved = true
+        })
+
+        await vi.waitFor(() => expect(updateTracksSpy).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(pollReindexSpy).toHaveBeenCalledTimes(1))
+        expect(pollReindexSpy).toHaveBeenCalledWith(['pic-1', 'tag-1'], { signal: expect.any(AbortSignal) })
+        // Still pending: the poll has not resolved yet.
+        expect(resolved).toBe(false)
+        expect(invalidateSpy).not.toHaveBeenCalled()
+        expect(session.isSaving.value).toBe(true)
+
+        resolvePoll({ failed: 1, pending: 0 })
+        await done
+        expect(resolved).toBe(true)
+        expect(invalidateSpy).toHaveBeenCalled()
+        expect(session.isSaving.value).toBe(false)
+        expect(reindexWarnings()).toEqual([
+            expect.objectContaining({
+                severity: 'warn',
+                detail: 'The re-index did not confirm completion for 1 item; if the change does not appear, a full scan will fix it.',
+                life: 8000
+            })
+        ])
+    })
+
+    it('warns when a picture write\'s polled re-index fails', async () => {
+        const session = mkSession()
+        applyPictureSpy.mockResolvedValue({
+            ok: true,
+            slot: 'folder',
+            type: 'Back Cover',
+            reindex: { execution_id: 'pic-1' }
+        })
+        pollReindexSpy.mockResolvedValue({ failed: 1, pending: 0 })
+        session.stagePictureSet('album', 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        await session.save()
+        expect(pollReindexSpy).toHaveBeenCalledWith(['pic-1'], { signal: expect.any(AbortSignal) })
+        expect(reindexWarnings()).toEqual([
+            expect.objectContaining({
+                severity: 'warn',
+                detail: 'The re-index did not confirm completion for 1 item; if the change does not appear, a full scan will fix it.',
+                life: 8000
+            })
+        ])
+    })
+
+    it('warns when a picture removal\'s polled re-index fails', async () => {
+        const session = mkSession()
+        deletePictureSpy.mockResolvedValue({ ok: true, reindex: { execution_id: 'del-1' } })
+        pollReindexSpy.mockResolvedValue({ failed: 1, pending: 0 })
+        session.stagePictureRemoval('album', 'Back Cover', 'folder', ['album/a.mp3'])
+        await session.save()
+        expect(pollReindexSpy).toHaveBeenCalledWith(['del-1'], { signal: expect.any(AbortSignal) })
+        expect(reindexWarnings()).toEqual([
+            expect.objectContaining({
+                detail: 'The re-index did not confirm completion for 1 item; if the change does not appear, a full scan will fix it.'
+            })
+        ])
+    })
+
+    // A partial album-identity edit may have split the album on disk; the
+    // server flags it with a `warning` and the session must surface it, or the
+    // stranded cover/stars are lost silently.
+    const albumSplitWarnings = () =>
+        toastAddSpy.mock.calls
+            .map((c) => c[0])
+            .filter((t) => t.summary === 'Album may have been split')
+
+    it('surfaces the album-split warning the server returns on a tag save', async () => {
+        const session = mkSession()
+        updateTracksSpy.mockResolvedValue({
+            results: [{ path: 'album/a.mp3', ok: true }],
+            warning: 'some files could not be updated; the album may have moved'
+        })
+        session.stageField(['album/a.mp3'], 'album', 'New Album Name')
+        await session.save()
+        expect(albumSplitWarnings()).toEqual([
+            expect.objectContaining({
+                severity: 'warn',
+                detail: 'some files could not be updated; the album may have moved'
+            })
+        ])
+    })
+
+    it('does not warn about a split when the server returns no warning', async () => {
+        const session = mkSession()
+        updateTracksSpy.mockResolvedValue({
+            results: [{ path: 'album/a.mp3', ok: true }]
+        })
+        session.stageField(['album/a.mp3'], 'album', 'New Album Name')
+        await session.save()
+        expect(albumSplitWarnings()).toEqual([])
+    })
+
+    // On an abort partway through pictures, the ids collected BEFORE the
+    // failure are still on disk and must still be polled — a partial batch's
+    // index still has to settle even though the save is bailing out.
+    it('polls the ids collected so far when the save aborts partway through pictures', async () => {
+        const session = mkSession()
+        deletePictureSpy.mockResolvedValue({ ok: true, reindex: { execution_id: 'del-1' } })
+        applyPictureSpy.mockRejectedValue(new Error('boom'))
+        pollReindexSpy.mockResolvedValue({ failed: 1, pending: 0 })
+        session.stagePictureRemoval('album', 'Back Cover', 'folder', ['album/a.mp3'])
+        session.stagePictureSet('album', 'Front Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        await session.save()
+        expect(pollReindexSpy).toHaveBeenCalledWith(['del-1'], { signal: expect.any(AbortSignal) })
+        expect(reindexWarnings()).toEqual([
+            expect.objectContaining({
+                detail: 'The re-index did not confirm completion for 1 item; if the change does not appear, a full scan will fix it.'
+            })
+        ])
+    })
+
+    it('stays silent when every collected write re-indexed cleanly', async () => {
+        const session = mkSession()
+        deletePictureSpy.mockResolvedValue({ ok: true, reindex: { execution_id: 'del-1' } })
+        session.stagePictureRemoval('album', 'Back Cover', 'folder', ['album/a.mp3'])
+        await session.save()
+        expect(pollReindexSpy).toHaveBeenCalledWith(['del-1'], { signal: expect.any(AbortSignal) })
+        expect(reindexWarnings()).toEqual([])
+    })
+
+    it('aborts the save on the first failure, keeping the failed op staged', async () => {
+        const session = mkSession()
+        applyPictureSpy.mockRejectedValue(new Error('boom'))
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        await session.save()
+        expect(session.getPictureOp(ALBUM, 'Back Cover', 'folder')).toBeDefined()
+        expect(session.hasStagedChanges.value).toBe(true)
+    })
+
+    // Surface, on a picture-save abort, that the pending tag edits were skipped
+    // rather than leave the user with only the picture error and the unsaved pill.
+    const skippedTagWarnings = () =>
+        toastAddSpy.mock.calls
+            .map((c) => c[0])
+            .filter((t) => typeof t.summary === 'string' && t.summary.includes('were not saved'))
+
+    it('warns that pending tag edits were skipped when a picture save aborts', async () => {
+        const session = mkSession()
+        applyPictureSpy.mockRejectedValue(new Error('boom'))
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        session.stageField(['album/a.mp3'], 'title', 'New')
+        await session.save()
+        expect(updateTracksSpy).not.toHaveBeenCalled()
+        expect(skippedTagWarnings()).toEqual([
+            expect.objectContaining({
+                severity: 'warn',
+                summary: 'Tag edits for 1 track were not saved'
+            })
+        ])
+    })
+
+    it('stays silent about skipped tag edits when none were pending', async () => {
+        const session = mkSession()
+        applyPictureSpy.mockRejectedValue(new Error('boom'))
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        await session.save()
+        expect(skippedTagWarnings()).toEqual([])
+    })
+
+    it('flags the staged tracks in stagedPaths for embedded ops', () => {
+        const tracks = [
+            mkTrack({ path: 'album/a.mp3' }),
+            mkTrack({ path: 'album/b.mp3' }),
+            mkTrack({ path: 'album/c.mp3' })
+        ]
+        const session = mkSession(tracks)
+        // Embedded op staged with a two-track selection: only those two flag.
+        session.stagePictureSet(ALBUM, 'Back Cover', 'embedded', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3',
+            'album/b.mp3'
+        ])
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(true)
+        expect(session.stagedPaths.value.has('album/b.mp3')).toBe(true)
+        expect(session.stagedPaths.value.has('album/c.mp3')).toBe(false)
+    })
+
+    it('flags every track of the directory in stagedPaths for folder ops', () => {
+        const tracks = [
+            mkTrack({ path: 'album/a.mp3' }),
+            mkTrack({ path: 'album/b.mp3' }),
+            mkTrack({ path: 'other/x.mp3' })
+        ]
+        const session = mkSession(tracks)
+        // A folder-art change belongs to the whole album, whoever was selected.
+        session.stagePictureRemoval(ALBUM, 'Front Cover', 'folder', ['album/a.mp3'])
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(true)
+        expect(session.stagedPaths.value.has('album/b.mp3')).toBe(true)
+        expect(session.stagedPaths.value.has('other/x.mp3')).toBe(false)
+    })
+
+    it('clears stagedPaths again when the op is discarded or saved', async () => {
+        const session = mkSession()
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file: null, imageUrl: 'u' }, [
+            'album/a.mp3'
+        ])
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(true)
+        session.discardPictureOp(ALBUM, 'Back Cover', 'folder')
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(false)
+
+        session.stagePictureRemoval(ALBUM, 'Back Cover', 'embedded', ['album/a.mp3'])
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(true)
+        await session.save()
+        expect(session.stagedPaths.value.has('album/a.mp3')).toBe(false)
+    })
+
+    // ----- Multi-folder (multi-disc) albums -----
+
+    const discTracks = [
+        mkTrack({ path: 'Release/CD 1/01.mp3', album: 'Sensaciones' }),
+        mkTrack({ path: 'Release/CD 1/02.mp3', album: 'Sensaciones' }),
+        mkTrack({ path: 'Release/CD 2/01.mp3', album: 'Sensaciones' })
+    ]
+    const discPaths = discTracks.map((t) => t.path)
+
+    it('keys picture ops by album, so both disc folders share one cell', () => {
+        const session = mkSession(discTracks)
+        const key = albumKey(discTracks[0])
+        session.stagePictureSet(
+            key,
+            'Front Cover',
+            'folder',
+            { file: null, imageUrl: 'http://img/x.jpg' },
+            discPaths
+        )
+        // The op is reachable under the album's key regardless of which disc
+        // folder the user had selected.
+        expect(session.getPictureOp(key, 'Front Cover', 'folder')?.kind).toBe('set')
+        expect(albumKey(discTracks[2])).toBe(key)
+    })
+
+    it('save sends every selected path so folder art lands in each disc folder', async () => {
+        const session = mkSession(discTracks)
+        session.stagePictureSet(
+            albumKey(discTracks[0]),
+            'Front Cover',
+            'folder',
+            { file: null, imageUrl: 'http://img/x.jpg' },
+            discPaths
+        )
+        await session.save()
+        const form = applyPictureSpy.mock.calls[0][0] as FormData
+        expect(form.getAll('paths')).toEqual(discPaths)
+    })
+
+    it('save sends the paths on a folder removal too, so each disc folder is cleaned', async () => {
+        const session = mkSession(discTracks)
+        session.stagePictureRemoval(albumKey(discTracks[0]), 'Front Cover', 'folder', discPaths)
+        await session.save()
+        expect(deletePictureSpy).toHaveBeenCalledWith({
+            scanFolder: 'Main',
+            type: 'Front Cover',
+            slot: 'folder',
+            paths: discPaths
+        })
+    })
+
+    it('flags every track of the album in stagedPaths for a folder op', () => {
+        const tracks = [...discTracks, mkTrack({ path: 'Other/01.mp3', album: 'Something Else' })]
+        const session = mkSession(tracks)
+        session.stagePictureRemoval(albumKey(discTracks[0]), 'Front Cover', 'folder', [
+            'Release/CD 1/01.mp3'
+        ])
+        // Both disc folders belong to the album; the unrelated album does not.
+        for (const p of discPaths) {
+            expect(session.stagedPaths.value.has(p)).toBe(true)
+        }
+        expect(session.stagedPaths.value.has('Other/01.mp3')).toBe(false)
+    })
+
+    it('drops ops whose album no longer has any listed track', async () => {
+        const tracks = ref<Track[]>(discTracks)
+        const session = useEditSession(
+            () => tracks.value,
+            () => 'Main'
+        )
+        session.stagePictureRemoval(albumKey(discTracks[0]), 'Front Cover', 'folder', discPaths)
+        expect(session.hasStagedChanges.value).toBe(true)
+        // Navigating to a folder with an unrelated album drops the stale op.
+        tracks.value = [mkTrack({ path: 'Other/01.mp3', album: 'Something Else' })]
+        await nextTick()
+        expect(session.hasStagedChanges.value).toBe(false)
+    })
+
+    it('discardAll drops all picture ops and revokes previews', () => {
+        const session = mkSession()
+        const file = new File(['x'], 'art.png', { type: 'image/png' })
+        session.stagePictureSet(ALBUM, 'Back Cover', 'folder', { file, imageUrl: null }, [
+            'album/a.mp3'
+        ])
+        session.stagePictureRemoval(ALBUM, 'Media', 'folder', ['album/a.mp3'])
+        session.discardAll()
+        expect(session.hasStagedChanges.value).toBe(false)
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
+    })
+
+    it('save drops the music-UI caches, not just the editor views', async () => {
+        const track = mkTrack({ path: 'album/a.mp3', title: 'Original' })
+        const session = mkSession([track])
+        session.overlays.value.set('album/a.mp3', { title: 'Changed' })
+        await session.save()
+        const keys = invalidateSpy.mock.calls.map((c) => c[0].queryKey)
+        expect(keys).toContainEqual(['metadata', 'tracks'])
+        expect(keys).toContainEqual(['subsonic'])
+    })
+})
+
+describe('candidateToOverlay', () => {
+    const candidate: IdentifyCandidate = {
+        score: 0.95,
+        recording_mbid: 'rec-id',
+        title: 'Song',
+        artists: [{ name: 'Artist', mbid: 'artist-id' }],
+        releases: [
+            {
+                release_mbid: 'rel-id',
+                release_group_mbid: 'rg-id',
+                album: 'Album',
+                year: 1999,
+                track_number: 5,
+                disc_number: 1
+            }
+        ]
+    }
+
+    it('stages title, recording id and artists without a release', () => {
+        const overlay = candidateToOverlay(candidate, null)
+        expect(overlay).toEqual({
+            title: 'Song',
+            mb_recording_id: 'rec-id',
+            artists: [{ name: 'Artist', mbid: 'artist-id' }]
+        })
+    })
+
+    it('adds album fields when a release is picked', () => {
+        const overlay = candidateToOverlay(candidate, candidate.releases[0])
+        expect(overlay.album).toBe('Album')
+        expect(overlay.mb_release_id).toBe('rel-id')
+        expect(overlay.mb_release_group_id).toBe('rg-id')
+        expect(overlay.year).toBe(1999)
+        expect(overlay.track_number).toBe(5)
+        expect(overlay.disc_number).toBe(1)
+    })
+
+    it('stages the release-group genres when the dialog resolved some', () => {
+        // Genres are not in the fingerprint match: the dialog looks them up for
+        // the release group of the release the user picked, then hands them over.
+        const overlay = candidateToOverlay(candidate, candidate.releases[0], [
+            'Grunge',
+            'Alternative Rock'
+        ])
+        expect(overlay.genres).toEqual(['Grunge', 'Alternative Rock'])
+    })
+
+    it('stages no genres when the lookup produced none', () => {
+        // An empty list must stay ABSENT rather than stage []: staging an empty
+        // array would wipe genres the file already carries.
+        expect(candidateToOverlay(candidate, candidate.releases[0], []).genres).toBeUndefined()
+        expect(candidateToOverlay(candidate, candidate.releases[0]).genres).toBeUndefined()
+    })
+
+    it('stages the release-group types when the dialog resolved some', () => {
+        const overlay = candidateToOverlay(candidate, candidate.releases[0], [], [
+            'Album',
+            'Compilation'
+        ])
+        expect(overlay.release_types).toEqual(['Album', 'Compilation'])
+    })
+
+    it('stages no release types when the lookup produced none', () => {
+        // Absent, not []: an empty stage would wipe the file's existing types.
+        expect(
+            candidateToOverlay(candidate, candidate.releases[0], [], []).release_types
+        ).toBeUndefined()
+        expect(candidateToOverlay(candidate, candidate.releases[0]).release_types).toBeUndefined()
+    })
+
+    it('omits artists, year and positions when absent', () => {
+        const overlay = candidateToOverlay(
+            { ...candidate, artists: [] },
+            {
+                release_mbid: 'r',
+                release_group_mbid: 'g',
+                album: 'A',
+                year: 0,
+                track_number: 0,
+                disc_number: 0
+            }
+        )
+        expect(overlay.artists).toBeUndefined()
+        expect(overlay.year).toBeUndefined()
+        expect(overlay.track_number).toBeUndefined()
+        expect(overlay.disc_number).toBeUndefined()
+    })
+})
+
+describe('albumPickToOverlay', () => {
+    const option: AlbumOption = {
+        release_mbid: 'rel-id',
+        release_group_mbid: 'rg-id',
+        album: 'Album',
+        year: 2000,
+        artists: [{ name: 'Artist', mbid: 'artist-id' }],
+        track_count: 10,
+        disc_count: 1,
+        matched_count: 8,
+        mean_score: 0.92,
+        enriched: true,
+        tracks: [],
+        assignments: []
+    }
+
+    // Most cases here are about the option/assignment mapping, not about genres,
+    // so they take the no-genres default the dialog produces when a release group
+    // has none. The genre cases pass their own list.
+    const mkPick = (over: Partial<AlbumIdentifyPick> = {}): AlbumIdentifyPick => ({
+        path: 'a.mp3',
+        option,
+        assignment: null,
+        genres: [],
+        releaseTypes: [],
+        ...over
+    })
+
+    // A Go nil slice marshals to JSON null, so `artists` can arrive null even
+    // though the type declares an array. That must degrade to "no artists
+    // staged", never throw and lose the whole apply.
+    it('survives null artist lists on the option and the assignment', () => {
+        const pick = {
+            path: 'a.mp3',
+            option: { ...option, artists: null },
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: 'rec-id',
+                artists: null,
+                disc_number: 1,
+                track_number: 5,
+                score: 0.95
+            }
+        } as unknown as AlbumIdentifyPick
+
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.album_artists).toBeUndefined()
+        expect(overlay.artists).toBeUndefined()
+        // The rest of the pick still stages normally.
+        expect(overlay.album).toBe('Album')
+        expect(overlay.title).toBe('Song')
+        expect(overlay.track_number).toBe(5)
+    })
+
+    it('stages both album-level and song-level fields when assignment is present', () => {
+        const pick = mkPick({
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: 'rec-id',
+                artists: [{ name: 'Song Artist', mbid: 'song-artist-id' }],
+                disc_number: 1,
+                track_number: 5,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.album).toBe('Album')
+        expect(overlay.mb_release_id).toBe('rel-id')
+        expect(overlay.mb_release_group_id).toBe('rg-id')
+        expect(overlay.year).toBe(2000)
+        expect(overlay.album_artists).toEqual([{ name: 'Artist', mbid: 'artist-id' }])
+        expect(overlay.title).toBe('Song')
+        expect(overlay.mb_recording_id).toBe('rec-id')
+        expect(overlay.artists).toEqual([{ name: 'Song Artist', mbid: 'song-artist-id' }])
+        expect(overlay.disc_number).toBe(1)
+        expect(overlay.track_number).toBe(5)
+    })
+
+    it('stages ONLY album-level fields when assignment is null', () => {
+        const overlay = albumPickToOverlay(mkPick())
+        expect(overlay.album).toBe('Album')
+        expect(overlay.mb_release_id).toBe('rel-id')
+        expect(overlay.mb_release_group_id).toBe('rg-id')
+        expect(overlay.year).toBe(2000)
+        expect(overlay.album_artists).toEqual([{ name: 'Artist', mbid: 'artist-id' }])
+        expect(overlay.title).toBeUndefined()
+        expect(overlay.mb_recording_id).toBeUndefined()
+        expect(overlay.artists).toBeUndefined()
+        expect(overlay.track_number).toBeUndefined()
+        expect(overlay.disc_number).toBeUndefined()
+    })
+
+    it('omits year when zero', () => {
+        const overlay = albumPickToOverlay(mkPick({ option: { ...option, year: 0 } }))
+        expect(overlay.year).toBeUndefined()
+        expect(overlay.album).toBe('Album')
+    })
+
+    it('omits track_number and disc_number when zero', () => {
+        const pick = mkPick({
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: 'rec-id',
+                artists: [],
+                disc_number: 0,
+                track_number: 0,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.track_number).toBeUndefined()
+        expect(overlay.disc_number).toBeUndefined()
+        expect(overlay.title).toBe('Song')
+    })
+
+    it('stages the release-group genres when the dialog resolved some', () => {
+        const overlay = albumPickToOverlay(mkPick(), ['Grunge', 'Alternative Rock'])
+        expect(overlay.genres).toEqual(['Grunge', 'Alternative Rock'])
+    })
+
+    it('stages no genres when the lookup produced none', () => {
+        // Absent, not []: an empty stage would wipe the file's existing genres.
+        expect(albumPickToOverlay(mkPick(), []).genres).toBeUndefined()
+        expect(albumPickToOverlay(mkPick()).genres).toBeUndefined()
+    })
+
+    it('stages the release-group types when the dialog resolved some', () => {
+        const overlay = albumPickToOverlay(mkPick(), [], ['Album', 'Compilation'])
+        expect(overlay.release_types).toEqual(['Album', 'Compilation'])
+    })
+
+    it('stages no release types when the lookup produced none', () => {
+        expect(albumPickToOverlay(mkPick(), [], []).release_types).toBeUndefined()
+        expect(albumPickToOverlay(mkPick()).release_types).toBeUndefined()
+    })
+
+    it('omits empty album string', () => {
+        const overlay = albumPickToOverlay(mkPick({ option: { ...option, album: '' } }))
+        expect(overlay.album).toBeUndefined()
+        expect(overlay.mb_release_id).toBe('rel-id')
+    })
+
+    it('omits empty title string', () => {
+        const pick = mkPick({
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: '',
+                recording_mbid: 'rec-id',
+                artists: [],
+                disc_number: 1,
+                track_number: 1,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.title).toBeUndefined()
+        expect(overlay.mb_recording_id).toBe('rec-id')
+    })
+
+    it('omits empty recording_mbid string', () => {
+        const pick = mkPick({
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: '',
+                artists: [],
+                disc_number: 1,
+                track_number: 1,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.mb_recording_id).toBeUndefined()
+        expect(overlay.title).toBe('Song')
+    })
+
+    it('omits empty release_mbid and release_group_mbid strings', () => {
+        const overlay = albumPickToOverlay(
+            mkPick({ option: { ...option, release_mbid: '', release_group_mbid: '' } })
+        )
+        expect(overlay.mb_release_id).toBeUndefined()
+        expect(overlay.mb_release_group_id).toBeUndefined()
+        expect(overlay.album).toBe('Album')
+    })
+
+    it('omits album_artists when the list is empty', () => {
+        const overlay = albumPickToOverlay(mkPick({ option: { ...option, artists: [] } }))
+        expect(overlay.album_artists).toBeUndefined()
+        expect(overlay.album).toBe('Album')
+    })
+
+    it('omits artists when the assignment list is empty', () => {
+        const pick = mkPick({
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: 'rec-id',
+                artists: [],
+                disc_number: 1,
+                track_number: 1,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick)
+        expect(overlay.artists).toBeUndefined()
+        expect(overlay.title).toBe('Song')
+    })
+
+    it('never stages compilation, disc_subtitle or grouping', () => {
+        // Identification says nothing reliable about either. Genres are NOT in
+        // this list: they come from a release-group lookup the dialog performs.
+        const pick = mkPick({
+            genres: ['Grunge'],
+            assignment: {
+                path: 'a.mp3',
+                source: 'fingerprint',
+                title: 'Song',
+                recording_mbid: 'rec-id',
+                artists: [],
+                disc_number: 1,
+                track_number: 1,
+                score: 0.95
+            }
+        })
+        const overlay = albumPickToOverlay(pick, pick.genres)
+        expect(overlay.compilation).toBeUndefined()
+        expect(overlay.disc_subtitle).toBeUndefined()
+        expect(overlay.grouping).toBeUndefined()
+        expect(overlay.genres).toEqual(['Grunge'])
+    })
+})
+
+describe('useEditSession artist image', () => {
+    const FOLDER = 'Radiohead'
+    const mkSession = (scanFolder = 'Main') =>
+        useEditSession(
+            () => [mkTrack({ path: 'Radiohead/OK Computer/a.mp3' })],
+            () => scanFolder
+        )
+
+    beforeEach(() => {
+        applyArtistImageSpy.mockReset()
+        applyArtistImageSpy.mockResolvedValue({ ok: true, path: 'Radiohead/artist.jpg' })
+        deleteArtistImageSpy.mockReset()
+        deleteArtistImageSpy.mockResolvedValue({ ok: true })
+        updateTracksSpy.mockReset()
+        updateTracksSpy.mockResolvedValue({ results: [] })
+        toastAddSpy.mockReset()
+        pollReindexSpy.mockReset()
+        pollReindexSpy.mockResolvedValue({ failed: 0, pending: 0 })
+        vi.stubGlobal('URL', {
+            ...URL,
+            createObjectURL: vi.fn(() => 'blob:preview'),
+            revokeObjectURL: vi.fn()
+        })
+    })
+
+    it('stages a set op keyed by folder and flags unsaved changes', () => {
+        const session = mkSession()
+        expect(session.hasStagedChanges.value).toBe(false)
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb', url: 'http://p/x.jpg' })
+        expect(session.hasStagedChanges.value).toBe(true)
+        expect(session.getArtistImageOp(FOLDER)?.kind).toBe('set')
+    })
+
+    it('previews an online pick with the thumbnail, keeping the full url for the save', () => {
+        const session = mkSession()
+        session.stageArtistImageSet(FOLDER, {
+            file: null,
+            mbid: 'mb',
+            url: 'http://p/full.jpg',
+            previewUrl: 'http://p/thumb.jpg'
+        })
+        expect(session.getArtistImageOp(FOLDER)).toMatchObject({
+            kind: 'set',
+            preview: 'http://p/thumb.jpg',
+            url: 'http://p/full.jpg'
+        })
+    })
+
+    it('does not flag individual track rows (folder-level edit)', () => {
+        const session = mkSession()
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb', url: 'http://p/x.jpg' })
+        expect(session.stagedPaths.value.size).toBe(0)
+    })
+
+    it('save posts the set op with the folder path and the online pick', async () => {
+        const session = mkSession()
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb-1', url: 'http://p/x.jpg' })
+        await session.save()
+        expect(applyArtistImageSpy).toHaveBeenCalledTimes(1)
+        const form = applyArtistImageSpy.mock.calls[0][0] as FormData
+        expect(form.get('path')).toBe(FOLDER)
+        expect(form.get('mbid')).toBe('mb-1')
+        expect(form.get('url')).toBe('http://p/x.jpg')
+        expect(form.get('artist')).toBeNull()
+        expect(form.getAll('paths')).toEqual([])
+        expect(session.hasStagedChanges.value).toBe(false)
+        expect(session.picturesSavedAt.value).toBeGreaterThan(0)
+    })
+
+    it('save sends an uploaded file as the image part', async () => {
+        const session = mkSession()
+        const file = new File(['x'], 'art.png', { type: 'image/png' })
+        session.stageArtistImageSet(FOLDER, { file, mbid: null, url: null })
+        await session.save()
+        const form = applyArtistImageSpy.mock.calls[0][0] as FormData
+        expect(form.get('image')).toBeInstanceOf(File)
+        expect(form.get('mbid')).toBeNull()
+    })
+
+    it('save deletes a removal op by folder', async () => {
+        const session = mkSession()
+        session.stageArtistImageRemoval(FOLDER)
+        await session.save()
+        expect(deleteArtistImageSpy).toHaveBeenCalledWith('Main', FOLDER)
+        expect(session.hasStagedChanges.value).toBe(false)
+    })
+
+    // The artist-image APIs are called raw, not through a mutation, so save()
+    // must collect their execution id itself, exactly like the picture path.
+    it('collects the artist-image write\'s execution id and polls it', async () => {
+        const session = mkSession()
+        applyArtistImageSpy.mockResolvedValue({
+            ok: true,
+            path: 'Radiohead/artist.jpg',
+            reindex: { execution_id: 'art-1' }
+        })
+        pollReindexSpy.mockResolvedValue({ failed: 1, pending: 0 })
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb-1', url: 'http://p/x.jpg' })
+        await session.save()
+        expect(pollReindexSpy).toHaveBeenCalledWith(['art-1'], { signal: expect.any(AbortSignal) })
+        expect(toastAddSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+                severity: 'warn',
+                summary: 'Saved, but the index was not confirmed updated',
+                detail: 'The re-index did not confirm completion for 1 item; if the change does not appear, a full scan will fix it.'
+            })
+        )
+    })
+
+    it('surfaces an error toast when an artist-image write fails', async () => {
+        const session = mkSession()
+        // Unlike the picture path (whose mutations toast on error), the artist
+        // APIs are called raw — a failed write must not vanish silently while
+        // the rest of the save is aborted.
+        applyArtistImageSpy.mockReset()
+        applyArtistImageSpy.mockRejectedValue(new Error('write failed'))
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb', url: 'http://p/x.jpg' })
+        await session.save()
+        const errorToasts = toastAddSpy.mock.calls
+            .map((c) => c[0] as { severity?: string })
+            .filter((tst) => tst.severity === 'error')
+        expect(errorToasts.length).toBeGreaterThan(0)
+    })
+
+    it('discardArtistImageOp clears it and revokes a file preview', () => {
+        const session = mkSession()
+        const file = new File(['x'], 'art.png', { type: 'image/png' })
+        session.stageArtistImageSet(FOLDER, { file, mbid: null, url: null })
+        session.discardArtistImageOp(FOLDER)
+        expect(session.getArtistImageOp(FOLDER)).toBeUndefined()
+        expect(session.hasStagedChanges.value).toBe(false)
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
+    })
+
+    it('discardAll clears a staged artist image', () => {
+        const session = mkSession()
+        session.stageArtistImageSet(FOLDER, { file: null, mbid: 'mb', url: 'http://p/x.jpg' })
+        session.discardAll()
+        expect(session.getArtistImageOp(FOLDER)).toBeUndefined()
+        expect(session.hasStagedChanges.value).toBe(false)
+    })
+})

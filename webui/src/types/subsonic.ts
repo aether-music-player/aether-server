@@ -1,0 +1,308 @@
+import type { LibraryView } from '@/types/libraries'
+
+export interface SubsonicResponse<T = unknown> {
+    'subsonic-response': {
+        status: 'ok' | 'failed'
+        version: string
+        type?: string
+        serverVersion?: string
+        openSubsonic?: boolean
+        error?: SubsonicError
+    } & T
+}
+
+export interface SubsonicError {
+    code: number
+    message: string
+}
+
+/**
+ * getUser's record, the fields Aether varies: `username` is the caller's real
+ * login (whatever `username` parameter was sent), `adminRole` follows the same
+ * lookup that gates the admin-only /rest writes, and `settingsRole` mirrors it.
+ * The other roles are constants.
+ */
+export interface SubsonicUser {
+    username: string
+    adminRole: boolean
+}
+
+export interface Artist {
+    id: string
+    name: string
+    albumCount?: number
+    songCount?: number
+    starred?: string
+    coverArt?: string
+    artistImageUrl?: string
+}
+
+// One disc of a multi-disc album that carries a subtitle (OpenSubsonic
+// AlbumID3.discTitles). Discs without a subtitle are not listed.
+export interface DiscTitle {
+    disc: number
+    title: string
+}
+
+// Aether's `albumGroupings` extension: a named container for albums read from the
+// GROUPING tag (a franchise, a series, a box set).
+export interface Grouping {
+    id: string
+    name: string
+    albumCount?: number
+    songCount?: number
+    duration?: number
+    // Earliest album year; absent when no album carries one.
+    year?: number
+    coverArt?: string
+}
+
+// A grouping with its albums, oldest first (getGrouping).
+export interface GroupingWithAlbums extends Grouping {
+    album?: Album[]
+}
+
+export interface Album {
+    id: string
+    name: string
+    artist?: string
+    artistId?: string
+    // OpenSubsonic AlbumID3: every album artist (`artist`/`artistId` name only the
+    // first). An artist page uses it to tell their own albums from appearances.
+    artists?: Artist[]
+    coverArt?: string
+    songCount?: number
+    duration?: number
+    created?: string
+    year?: number
+    genre?: string
+    starred?: string
+    discTitles?: DiscTitle[]
+    // OpenSubsonic AlbumID3: the flat MusicBrainz release-type list (primary first,
+    // then secondary types). Absent when the release carries no type tags.
+    releaseTypes?: string[]
+    // OpenSubsonic AlbumID3: a "Compilation" release type or the iTunes flag.
+    isCompilation?: boolean
+    // `albumGroupings` extension: the grouping the album belongs to, on getAlbum.
+    grouping?: { id: string; name: string }
+}
+
+export interface AlbumWithSongs extends Album {
+    song?: Song[]
+}
+
+export interface Song {
+    id: string
+    title: string
+    album?: string
+    albumId?: string
+    artist?: string
+    artistId?: string
+    coverArt?: string
+    duration?: number
+    bitRate?: number
+    track?: number
+    discNumber?: number
+    year?: number
+    genre?: string
+    size?: number
+    contentType?: string
+    suffix?: string
+    path?: string
+    starred?: string
+    isVideo?: boolean
+    streamUrl?: string
+}
+
+export interface Playlist {
+    id: string
+    name: string
+    comment?: string
+    owner?: string
+    public?: boolean
+    songCount: number
+    duration: number
+    created: string
+    changed?: string
+    coverArt?: string
+    // Aether's "playlistStar" extension: RFC3339, absent when not starred.
+    starred?: string
+    // Aether's "playlistStats" extension.
+    playCount?: number
+    played?: string
+}
+
+// Aether's "discovery" extension. The server owns the cross-type ranking and
+// reports it as an absolute `rank` on each entity, so the client merges the two
+// arrays with a sort rather than reimplementing the formula.
+export type DiscoveryReason =
+    | 'favorite'
+    | 'recentlyAdded'
+    | 'mostPlayed'
+    | 'recentlyPlayed'
+    | 'genreMatch'
+    | 'rediscover'
+
+export type DiscoveryAlbum = Album & { rank: number; reason: DiscoveryReason }
+export type DiscoveryPlaylist = Playlist & { rank: number; reason: DiscoveryReason }
+
+export interface DiscoveryPage {
+    album: DiscoveryAlbum[]
+    playlist: DiscoveryPlaylist[]
+}
+
+// One flattened feed entry. The discriminated union keeps the rendering
+// dispatcher type-safe without casts.
+export type DiscoveryFeedEntry =
+    | { type: 'album'; rank: number; reason: DiscoveryReason; album: DiscoveryAlbum }
+    | { type: 'playlist'; rank: number; reason: DiscoveryReason; playlist: DiscoveryPlaylist }
+
+export interface Genre {
+    value: string
+    songCount: number
+    albumCount: number
+    // Aether's "genreCoverArt" OpenSubsonic extension.
+    coverArt?: string
+}
+
+export interface MusicFolder {
+    id: number
+    name: string
+    // Aether's "musicFolderViews" OpenSubsonic extension: the ways the folder can
+    // be browsed, in display order, and the one of them it opens on; v2 adds
+    // splitViews — list each view as its own navigation entry.
+    views?: LibraryView[]
+    defaultView?: LibraryView
+    splitViews?: boolean
+    // Aether's "musicFolderIcon" OpenSubsonic extension: Material Symbols snake_case name.
+    icon?: string
+}
+
+// The musicFolderViews extension's (v2) description of the root: the whole
+// catalog, browsed without a musicFolderId. A folder's fields, minus id/name/icon.
+export interface CatalogView {
+    views?: LibraryView[]
+    defaultView?: LibraryView
+    splitViews?: boolean
+}
+
+// getMusicFolders: the folders (one per library) and, from servers with
+// musicFolderViews v2, the root's descriptor.
+export interface MusicFolders {
+    catalog?: CatalogView
+    folders: MusicFolder[]
+}
+
+export interface SearchResult3 {
+    artist?: Artist[]
+    album?: Album[]
+    song?: Song[]
+    // Aether's "searchGenres" OpenSubsonic extension: present only when the
+    // request asked for genres via genreCount.
+    genre?: Genre[]
+}
+
+export interface AlbumList {
+    album: Album[]
+}
+
+export interface AlbumLetter {
+    name: string // "#" or "A".."Z"
+    offset: number
+    count: number
+}
+
+export interface AlbumIndex {
+    total: number
+    index: AlbumLetter[]
+}
+
+// One entry of getReleaseTypes (Aether's "releaseTypeFilter" OpenSubsonic
+// extension, v2): a release type the albums in scope carry, and how many albums
+// filtering by it lists. Spellings that differ only in case are one entry.
+export interface ReleaseTypeCount {
+    name: string
+    albumCount: number
+}
+
+export interface ArtistIndex {
+    total: number
+    letters: AlbumLetter[]
+    items: Artist[]
+}
+
+// getGroupings, flattened into the same shape as the artist index so the alphabet
+// rail and the virtual grid work unchanged.
+export interface GroupingIndex {
+    total: number
+    letters: AlbumLetter[]
+    items: Grouping[]
+}
+
+// getStarred2. Unpaginated by spec — the whole favorites set arrives in one
+// response, so nothing built on it may assume an offset param exists.
+export interface Starred2 {
+    artist: Artist[]
+    album: Album[]
+    song: Song[]
+    playlist: Playlist[]
+}
+
+export interface ArtistInfo {
+    biography?: string
+    musicBrainzId?: string
+    lastFmUrl?: string
+    smallImageUrl?: string
+    mediumImageUrl?: string
+    largeImageUrl?: string
+    similarArtist?: Artist[]
+}
+
+export interface SearchParams {
+    query: string
+    artistCount?: number
+    artistOffset?: number
+    albumCount?: number
+    albumOffset?: number
+    songCount?: number
+    songOffset?: number
+    // Aether's "searchGenres" OpenSubsonic extension; omitted/0 means no genres.
+    genreCount?: number
+    genreOffset?: number
+}
+
+export interface PlayerState {
+    currentTrack: Song | null
+    queue: Song[]
+    currentIndex: number
+    isPlaying: boolean
+    volume: number
+    repeat: 'none' | 'all'
+    shuffle: boolean
+    currentTime: number
+    duration: number
+}
+
+export interface QueueItem extends Song {
+    queueId: string
+}
+
+// The saved cross-device playback session (getPlayQueueByIndex, the
+// "indexBasedQueue" extension). currentIndex is a queue slot rather than a track
+// id, because a queue may hold the same track more than once. position is the
+// offset in ms within that slot's track — the field that resumes mid-song.
+export interface SavedPlayQueue {
+    entry: Song[]
+    currentIndex: number
+    position: number
+    changedBy?: string
+    changed?: string
+}
+
+export interface InternetRadioStation {
+    id: string
+    name: string
+    streamUrl: string
+    homepageUrl?: string
+    coverArt?: string
+}

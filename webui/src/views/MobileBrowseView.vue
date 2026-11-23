@@ -1,0 +1,334 @@
+<script setup lang="ts">
+import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import Button from 'primevue/button'
+import Menu from 'primevue/menu'
+import type { MenuItem } from 'primevue/menuitem'
+import BrandMark from '@/components/common/BrandMark.vue'
+import ContentScaffold from '@/components/layout/ContentScaffold.vue'
+import BrowseAlbumShelf from '@/components/library/BrowseAlbumShelf.vue'
+import BrowseShelf from '@/components/library/BrowseShelf.vue'
+import DiscoveryFeedItem from '@/components/library/DiscoveryFeedItem.vue'
+import GenreCard from '@/components/library/GenreCard.vue'
+import PlaylistCard from '@/components/library/PlaylistCard.vue'
+import RadioStationCard from '@/components/library/RadioStationCard.vue'
+import { useAuth } from '@/composables/useAuth'
+import { useChangeServer } from '@/composables/useChangeServer'
+import { useDiscoveryFeed } from '@/composables/useDiscovery'
+import {
+    useGenres,
+    useMusicFolders,
+    usePlaylists,
+    useRadioStations
+} from '@/composables/useSubsonicQueries'
+import { useViewport } from '@/composables/useViewport'
+import { useWishlist } from '@/composables/useWishlist'
+import { BROWSE_SHELF_SIZE } from '@/lib/browseShelf'
+import { isDesktopApp } from '@/lib/host'
+
+/**
+ * The mobile shell's landing page AND its whole navigation surface — the phone's
+ * answer to the desktop sidebar, and where the hamburger in every top-level
+ * view's header goes (see `ContentScaffold`). It replaced `MobileNavDrawer`: a
+ * page can show what is *in* each destination instead of only naming it, and it
+ * needs none of an overlay's route-change / system-back bookkeeping, since
+ * leaving it is ordinary navigation.
+ *
+ * Sections follow the sidebar's order — Library, one shelf per dynamic library,
+ * Playlists, Genres, Radio — each a heading, a few items, and a "See all" link to
+ * the full view; the last three drop out of the page entirely when they hold
+ * nothing (see the show* computeds). Two things the drawer listed have no shelf
+ * to fill and live in
+ * the header instead: Search (a search box samples nothing) and the account
+ * entries the desktop keeps in the `UserMenu` popup — User settings / Admin /
+ * About, plus Change server (desktop app only) and Log out, behind the ⋮. Now
+ * Playing and the queue stay reachable through the `MiniPlayer`, which docks
+ * here as on any other route.
+ *
+ * Mobile only: the desktop shell has the sidebar, so arriving at desktop width
+ * (bookmark, rotation) replaces the route with /library — the mirror of the guard
+ * `HomeView` applies in the other direction.
+ */
+const router = useRouter()
+const { shell } = useViewport()
+const { canSignOut, isAdmin, managementApi, logout } = useAuth()
+const { confirmChangeServer } = useChangeServer()
+
+watch(
+    shell,
+    (currentShell) => {
+        if (currentShell === 'desktop') void router.replace({ name: 'library' })
+    },
+    { immediate: true }
+)
+
+// The Library shelf samples the whole catalog's ranked Discovery feed — the same
+// query the root `/library`'s Discover view renders in full, so this costs no
+// extra request once either surface has been visited. The per-library shelves
+// below show newest albums instead, whatever views their library offers.
+const {
+    items: discoveryItems,
+    isLoading: discoveryLoading,
+    isError: discoveryError
+} = useDiscoveryFeed()
+const discoveryShelf = computed(() =>
+    discoveryItems.value.slice(0, BROWSE_SHELF_SIZE).map((entry) => ({
+        key: entry.type === 'album' ? entry.album.id : entry.playlist.id,
+        entry
+    }))
+)
+
+// Same rule as the sidebar: shown from the first library on. A library is a
+// saved filter, so even a single one is a narrower view than the whole catalog
+// — which is what the Library shelf above samples.
+const { data: musicFolders } = useMusicFolders()
+const libraryShelves = computed(() => musicFolders.value ?? [])
+
+const { data: playlists, isError: playlistsError } = usePlaylists()
+const playlistShelf = computed(() =>
+    (playlists.value ?? [])
+        .slice(0, BROWSE_SHELF_SIZE)
+        .map((playlist) => ({ key: playlist.id, playlist }))
+)
+
+const { data: genres, isError: genresError } = useGenres()
+// Keyed by `value`: a genre has no id (see BrowseShelf).
+const genreShelf = computed(() =>
+    (genres.value ?? []).slice(0, BROWSE_SHELF_SIZE).map((genre) => ({ key: genre.value, genre }))
+)
+
+const { data: stations, isError: stationsError } = useRadioStations()
+const radioShelf = computed(() =>
+    (stations.value ?? []).slice(0, BROWSE_SHELF_SIZE).map((station) => ({ key: station.id, station }))
+)
+
+// Playlists, Genres and Radio are left OUT of the page entirely when they hold
+// nothing: a heading and a "See all" over empty space is chrome pointing at
+// nothing, and the landing page should read as what this server actually has.
+// Two consequences on purpose:
+//   - a failed request still renders the shelf, since its error line is the one
+//     thing an item-less shelf has to say — hiding it would report a network
+//     failure as "you have no playlists";
+//   - a section in flight stays out and appears with its items rather than
+//     flashing a spinner that turns out to be nothing.
+// The Library shelf is exempt: it is the page's primary destination, so an empty
+// library says so rather than leaving the page blank.
+const showPlaylists = computed(() => playlistShelf.value.length > 0 || playlistsError.value)
+const showGenres = computed(() => genreShelf.value.length > 0 || genresError.value)
+const showRadio = computed(() => radioShelf.value.length > 0 || stationsError.value)
+
+// The wishlist rides on the admin-only /api/v0, so its section is an admin's
+// only. Its entries have no cover until a scan finds them, so the section is a
+// heading, a one-line count and "See all" rather than a strip of cards.
+const showWishlist = computed(() => isAdmin.value && managementApi.value)
+const { data: wishlist, isError: wishlistError } = useWishlist(showWishlist)
+const wishlistSummary = computed(() => {
+    const all = wishlist.value ?? []
+    if (all.length === 0) return 'Nothing on your wishlist yet'
+    const found = all.filter((it) => it.in_library).length
+    return `${all.length} ${all.length === 1 ? 'item' : 'items'} · ${found} in library`
+})
+
+// Same entries and order as UserMenu's popup, so the two account surfaces read
+// alike: User settings → Admin (admins with the management API only) → About →
+// Change server (desktop app only) → Log out. Log out is gated on there being a
+// session to leave — a native or a key session (auth method "none" has nothing
+// to leave), and this is the phone's ONLY way out — the UserMenu lives in the
+// desktop sidebar. Change server asks first (see useChangeServer); the dialog
+// that shows the question is the one PlayerLayout mounts for both shells.
+const accountMenu = ref<InstanceType<typeof Menu> | null>(null)
+const accountItems = computed<MenuItem[]>(() => {
+    const items: MenuItem[] = [
+        {
+            label: 'User settings',
+            icon: 'ms-person',
+            command: () => void router.push('/user-settings')
+        }
+    ]
+    if (isAdmin.value && managementApi.value) {
+        items.push({ label: 'Admin', icon: 'ms-settings', command: () => void router.push('/settings') })
+    }
+    items.push({ label: 'About', icon: 'ms-info', command: () => void router.push('/about') })
+    // One separator for what ends or moves the session, as in UserMenu.
+    if (isDesktopApp() || canSignOut.value) {
+        items.push({ separator: true })
+    }
+    if (isDesktopApp()) {
+        items.push({ label: 'Change server', icon: 'ms-dns', command: () => confirmChangeServer() })
+    }
+    if (canSignOut.value) {
+        items.push({ label: 'Log out', icon: 'ms-logout', command: () => logout.mutate() })
+    }
+    return items
+})
+const toggleAccountMenu = (event: Event): void => accountMenu.value?.toggle(event)
+</script>
+
+<template>
+    <!-- nav-root: this view IS the hamburger's destination, so it carries no
+         hamburger of its own. The scaffold's own `title` is empty because the
+         brand takes its place — see #title-actions. -->
+    <ContentScaffold class="browse-view" title="" nav-root>
+        <!-- The brand IS this page's heading: /browse is the phone's home
+             surface, so it carries the app's identity the way the desktop
+             sidebar's does, rather than the word "Browse". It is the h1, so the
+             page still has exactly one top-level heading. -->
+        <template #title-actions>
+            <h1 class="browse-brand">
+                <BrandMark size="1.5rem" />
+                <span>A<span class="browse-brand-accent">e</span>ther</span>
+            </h1>
+        </template>
+
+        <template #actions>
+            <Button
+                class="browse-search-btn"
+                icon="ms-search"
+                text
+                rounded
+                aria-label="Search"
+                @click="router.push({ name: 'search' })"
+            />
+            <Button
+                class="browse-account-btn"
+                icon="ms-more-vert"
+                text
+                rounded
+                aria-label="Settings and account"
+                aria-haspopup="menu"
+                @click="toggleAccountMenu"
+            />
+            <Menu ref="accountMenu" :model="accountItems" :popup="true" />
+        </template>
+
+        <div class="browse-body">
+            <div class="browse-shelves content-col">
+                <BrowseShelf
+                    title="Library"
+                    icon="ms-explore"
+                    :to="{ name: 'library' }"
+                    :items="discoveryShelf"
+                    :loading="discoveryLoading"
+                    :error="discoveryError"
+                    error-text="Could not load the discovery feed"
+                >
+                    <template #card="{ item }">
+                        <DiscoveryFeedItem :entry="item.entry" layout="grid" />
+                    </template>
+                </BrowseShelf>
+
+                <BrowseAlbumShelf
+                    v-for="folder in libraryShelves"
+                    :key="folder.id"
+                    :folder-id="folder.id"
+                    :title="folder.name"
+                    :library-icon="folder.icon"
+                />
+
+                <BrowseShelf
+                    v-if="showPlaylists"
+                    title="Playlists"
+                    icon="ms-queue-music"
+                    :to="{ name: 'playlists' }"
+                    :items="playlistShelf"
+                    :error="playlistsError"
+                    error-text="Could not load playlists"
+                >
+                    <template #card="{ item }">
+                        <PlaylistCard :playlist="item.playlist" />
+                    </template>
+                </BrowseShelf>
+
+                <BrowseShelf
+                    v-if="showGenres"
+                    title="Genres"
+                    icon="ms-genres"
+                    :to="{ name: 'genres' }"
+                    :items="genreShelf"
+                    :error="genresError"
+                    error-text="Could not load genres"
+                >
+                    <template #card="{ item }">
+                        <GenreCard :genre="item.genre" />
+                    </template>
+                </BrowseShelf>
+
+                <BrowseShelf
+                    v-if="showRadio"
+                    title="Radio"
+                    icon="ms-radio"
+                    :to="{ name: 'radio' }"
+                    :items="radioShelf"
+                    :error="stationsError"
+                    error-text="Could not load radio stations"
+                >
+                    <template #card="{ item }">
+                        <RadioStationCard :station="item.station" />
+                    </template>
+                </BrowseShelf>
+
+                <BrowseShelf
+                    v-if="showWishlist"
+                    title="Wishlist"
+                    icon="ms-bookmark-heart"
+                    :to="{ name: 'wishlist' }"
+                    :items="[]"
+                    :error="wishlistError"
+                    error-text="Could not load the wishlist"
+                    :empty-text="wishlistSummary"
+                    class="wishlist-shelf"
+                />
+            </div>
+        </div>
+    </ContentScaffold>
+</template>
+
+<style scoped>
+/* The scaffold header aligns its row on the text baseline, which this header has
+   none of: the heading is an image plus a wordmark, and the actions are two round
+   icon buttons. As a flex container the h1's baseline is its FIRST item's — the
+   brand image's bottom edge — so baseline alignment lifts the whole brand above
+   the buttons. Center the row (and the title box inside it) instead. */
+.browse-view :deep(.scaffold-header-inner),
+.browse-view :deep(.scaffold-title) {
+    align-items: center;
+}
+
+/* Slotted into the scaffold's title slot, so ContentScaffold's own (scoped) h1
+   rules never reach it — the heading owns its whole box here. Same wordmark
+   weights as AppSidebar's brand, in the content palette rather than the nav
+   one, since this header sits on the page background. */
+.browse-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    margin: 0;
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: var(--app-text-primary);
+    white-space: nowrap;
+}
+
+.browse-brand-accent {
+    color: var(--app-accent);
+}
+
+/* Recipe B (docs/architecture/main-content-view-layout.md): the body scrolls
+   itself, and the shelves sit on the same column as the scaffold header's
+   title. */
+.browse-body {
+    height: 100%;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    /* With an empty queue there is no mini player below this page, so it is the
+       bottom-most surface and reserves the home-indicator inset itself. */
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+    box-sizing: border-box;
+}
+
+.browse-shelves {
+    display: flex;
+    flex-direction: column;
+}
+</style>

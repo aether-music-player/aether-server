@@ -1,0 +1,155 @@
+// internal/tags/taglib.go
+package tags
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"go.senan.xyz/taglib"
+)
+
+var taglibExtensions = map[string]bool{
+	".mp3": true, ".flac": true, ".aac": true, ".m4a": true, ".m4b": true, ".mp4": true,
+	".ogg": true, ".opus": true, ".wma": true, ".wav": true, ".wv": true, ".ape": true, ".aiff": true,
+}
+
+type TaglibReader struct{}
+
+func (TaglibReader) CanRead(absPath string) bool {
+	return taglibExtensions[strings.ToLower(filepath.Ext(absPath))]
+}
+
+// Read honours ctx only up front. The taglib calls below are synchronous cgo
+// with no cancellation of their own, so once one is under way it runs to
+// completion; checking here at least keeps an already-abandoned scan from
+// starting more reads. This is why FFProbeReader, which can be interrupted,
+// carries the timeout instead.
+func (TaglibReader) Read(ctx context.Context, absPath string) (Metadata, error) {
+	if err := ctx.Err(); err != nil {
+		return Metadata{}, fmt.Errorf("taglib %q: %w", absPath, err)
+	}
+	props, err := taglib.ReadProperties(absPath)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("read properties: %w", err)
+	}
+	raw, err := taglib.ReadTags(absPath)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("read tags: %w", err)
+	}
+	m := Metadata{
+		Duration: props.Length,
+		Bitrate:  int(props.BitRate),
+		HasCover: hasFrontCover(props.Images),
+	}
+	m.Title = first(raw, "title", "TITLE")
+	m.Artist = values(raw, "artist", "ARTIST")
+	m.AlbumArtist = values(raw, "albumartist", "ALBUMARTIST", "album_artist", "ALBUM_ARTIST")
+	m.Album = first(raw, "album", "ALBUM")
+	m.Genre = values(raw, "genre", "GENRE")
+	m.Year = parseYear(raw)
+	m.TrackNumber = parseInt(first(raw, "tracknumber", "TRACKNUMBER", "track", "TRACK"))
+	m.DiscNumber = parseInt(first(raw, "discnumber", "DISCNUMBER", "disc", "DISC"))
+	m.DiscSubtitle = first(raw, "discsubtitle", "DISCSUBTITLE", "TSST")
+	m.MBRecordingID = first(raw, "musicbrainz_trackid", "MUSICBRAINZ_TRACKID")
+	m.MBReleaseID = first(raw, "musicbrainz_albumid", "MUSICBRAINZ_ALBUMID")
+	m.MBReleaseGroupID = first(raw, "musicbrainz_releasegroupid", "MUSICBRAINZ_RELEASEGROUPID")
+	m.MBArtistID = allOrSingle(raw, "musicbrainz_artistid", "MUSICBRAINZ_ARTISTID", "MusicBrainz Artist Id")
+	m.MBAlbumArtistID = allOrSingle(raw, "musicbrainz_albumartistid", "MUSICBRAINZ_ALBUMARTISTID", "MusicBrainz Album Artist Id")
+	m.Lyrics = first(raw, "lyrics", "LYRICS", "USLT")
+	m.Grouping = strings.TrimSpace(first(raw, "grouping", "GROUPING"))
+	m.Compilation = parseBool(first(raw, "compilation", "COMPILATION", "TCMP"))
+	m.ReleaseTypes = allOrSingle(raw, "RELEASETYPE", "releasetype", "MUSICBRAINZ_ALBUMTYPE", "musicbrainz_albumtype")
+	m.ReplayGain = ReplayGain{
+		TrackGain: parseDBPtr(first(raw, "replaygain_track_gain", "REPLAYGAIN_TRACK_GAIN")),
+		TrackPeak: parseFloatPtr(first(raw, "replaygain_track_peak", "REPLAYGAIN_TRACK_PEAK")),
+		AlbumGain: parseDBPtr(first(raw, "replaygain_album_gain", "REPLAYGAIN_ALBUM_GAIN")),
+		AlbumPeak: parseFloatPtr(first(raw, "replaygain_album_peak", "REPLAYGAIN_ALBUM_PEAK")),
+	}
+	return m, nil
+}
+
+// ReadRawTags returns a file's complete, unfiltered tag map — the raw
+// key -> values pairs taglib exposes, including keys the structured reader does
+// not surface (legacy frames, ReplayGain, encoder and custom tags). It is the
+// raw-editor counterpart to TaglibReader.Read, and exists so callers reach the
+// raw tag map through this package rather than importing taglib directly.
+func ReadRawTags(absPath string) (map[string][]string, error) {
+	return taglib.ReadTags(absPath)
+}
+
+// ReadUnsupported lists a file's hidden-frame descriptors: metadata the tag map
+// cannot represent as text (ID3v2 PRIV/GEOB/POPM, unknown binary frames). The
+// descriptors can be handed back to a write to delete those frames.
+func ReadUnsupported(absPath string) ([]string, error) {
+	return taglib.ReadUnsupported(absPath)
+}
+
+func first(tags map[string][]string, keys ...string) string {
+	for _, k := range keys {
+		if vs, ok := tags[k]; ok && len(vs) > 0 && vs[0] != "" {
+			return vs[0]
+		}
+	}
+	return ""
+}
+
+func values(tags map[string][]string, keys ...string) []string {
+	for _, k := range keys {
+		if vs, ok := tags[k]; ok && len(vs) > 0 {
+			return vs
+		}
+	}
+	return nil
+}
+
+func parseInt(s string) int {
+	s = strings.Split(s, "/")[0]
+	i, _ := strconv.Atoi(strings.TrimSpace(s))
+	return i
+}
+
+func parseBool(s string) bool {
+	b, _ := strconv.ParseBool(s)
+	return b
+}
+
+func parseYear(tags map[string][]string) int {
+	for _, key := range []string{"originaldate", "ORIGINALDATE", "date", "DATE", "year", "YEAR"} {
+		if v := first(tags, key); v != "" {
+			if len(v) >= 4 {
+				if y, err := strconv.Atoi(v[:4]); err == nil && y > 0 {
+					return y
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func parseDBPtr(s string) *float64 {
+	if s == "" {
+		return nil
+	}
+	s = strings.ToLower(s)
+	s = strings.TrimSuffix(s, " db")
+	s = strings.TrimSuffix(s, "db")
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return nil
+	}
+	return &f
+}
+
+func parseFloatPtr(s string) *float64 {
+	if s == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return nil
+	}
+	return &f
+}

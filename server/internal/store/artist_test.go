@@ -1,0 +1,774 @@
+package store_test
+
+import (
+	"errors"
+	"slices"
+	"testing"
+
+	"github.com/andresbott/aether/internal/model"
+	"github.com/andresbott/aether/internal/store"
+	"github.com/andresbott/aether/internal/unidecode"
+	"gorm.io/gorm"
+)
+
+func TestFindOrCreateArtists(t *testing.T) {
+	s := testStore(t)
+	var artists []*model.Artist
+	err := s.Transaction(func(tx *store.Store) error {
+		var txErr error
+		artists, _, txErr = tx.FindOrCreateArtists([]string{"Björk", "Radiohead"}, nil)
+		return txErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 2 {
+		t.Fatalf("expected 2 artists, got %d", len(artists))
+	}
+	// Call again — should find existing
+	var again []*model.Artist
+	err = s.Transaction(func(tx *store.Store) error {
+		var txErr error
+		again, _, txErr = tx.FindOrCreateArtists([]string{"Björk"}, nil)
+		return txErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again[0].ID != artists[0].ID {
+		t.Fatal("expected same artist ID on second call")
+	}
+}
+
+func TestFindOrCreateArtistsSetsMBID(t *testing.T) {
+	s := testStore(t)
+	var got []*model.Artist
+	err := s.Transaction(func(tx *store.Store) error {
+		var e error
+		got, _, e = tx.FindOrCreateArtists([]string{"Björk"}, []string{"mbid-bjork"})
+		return e
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got[0].MBArtistID != "mbid-bjork" {
+		t.Fatalf("MBID not set, got %q", got[0].MBArtistID)
+	}
+	// Backfill: same artist, now with an MBID where it was set; calling again
+	// with empty must not clear it.
+	err = s.Transaction(func(tx *store.Store) error {
+		var e error
+		got, _, e = tx.FindOrCreateArtists([]string{"Björk"}, nil)
+		return e
+	})
+	if err != nil || got[0].MBArtistID != "mbid-bjork" {
+		t.Fatalf("MBID lost on re-find: %q (err %v)", got[0].MBArtistID, err)
+	}
+}
+
+func TestFindOrCreateArtistsBackfillsMBID(t *testing.T) {
+	s := testStore(t)
+	// First call: create artist with no MBID.
+	var first []*model.Artist
+	err := s.Transaction(func(tx *store.Store) error {
+		var e error
+		first, _, e = tx.FindOrCreateArtists([]string{"Portishead"}, nil)
+		return e
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if first[0].MBArtistID != "" {
+		t.Fatalf("expected empty MBID on first create, got %q", first[0].MBArtistID)
+	}
+	// Second call: same artist but now with a real MBID — must backfill.
+	var second, gained []*model.Artist
+	err = s.Transaction(func(tx *store.Store) error {
+		var e error
+		second, gained, e = tx.FindOrCreateArtists([]string{"Portishead"}, []string{"mbid-portishead"})
+		return e
+	})
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if second[0].ID != first[0].ID {
+		t.Fatal("expected same artist row")
+	}
+	if second[0].MBArtistID != "mbid-portishead" {
+		t.Fatalf("MBID not backfilled, got %q", second[0].MBArtistID)
+	}
+	// The artist gained an MBID, so it must be reported.
+	if len(gained) != 1 {
+		t.Fatalf("expected 1 artist in gained list, got %d", len(gained))
+	}
+	if gained[0].ID != first[0].ID {
+		t.Fatal("gained artist must be the same row")
+	}
+	if gained[0].MBArtistID != "mbid-portishead" {
+		t.Fatalf("gained artist must carry the new MBID, got %q", gained[0].MBArtistID)
+	}
+}
+
+// errQueryBoom is the injected failure used to simulate a real DB error (not a
+// missing row) on the lookup half of a find-or-create.
+var errQueryBoom = errors.New("boom: simulated db failure")
+
+// failQueries makes every SELECT on s fail with errQueryBoom while leaving
+// INSERTs working, which is exactly the shape a find-or-create must not
+// mistake for "row does not exist".
+func failQueries(t *testing.T, s *store.Store) {
+	t.Helper()
+	err := s.DB().Callback().Query().Before("gorm:query").
+		Register("test:fail_queries", func(tx *gorm.DB) {
+			_ = tx.AddError(errQueryBoom)
+		})
+	if err != nil {
+		t.Fatalf("register callback: %v", err)
+	}
+}
+
+func TestFindOrCreateArtistsPropagatesQueryError(t *testing.T) {
+	s := testStore(t)
+	failQueries(t, s)
+
+	_, _, err := s.FindOrCreateArtists([]string{"Björk"}, nil)
+	if err == nil {
+		t.Fatal("expected the DB error to propagate, got nil (a real failure was treated as not-found)")
+	}
+	if !errors.Is(err, errQueryBoom) {
+		t.Fatalf("expected the injected DB error, got %v", err)
+	}
+}
+
+func TestGetArtists(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	a1 := model.Artist{Name: "Björk", NameNorm: "bjork"}
+	a2 := model.Artist{Name: "Radiohead", NameNorm: "radiohead"}
+	db.Create(&a1)
+	db.Create(&a2)
+	alb1 := model.Album{Name: "Debut", NameNorm: "debut", AlbumArtistNorm: "bjork"}
+	alb2 := model.Album{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead"}
+	db.Create(&alb1)
+	db.Create(&alb2)
+	_ = db.Model(&alb1).Association("Artists").Replace([]*model.Artist{&a1})
+	_ = db.Model(&alb2).Association("Artists").Replace([]*model.Artist{&a2})
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 2 {
+		t.Fatalf("expected 2 artists, got %d", len(artists))
+	}
+}
+
+func TestGetArtist(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	artist := model.Artist{Name: "Radiohead", NameNorm: "radiohead"}
+	db.Create(&artist)
+	album := model.Album{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead"}
+	db.Create(&album)
+	_ = db.Model(&album).Association("Artists").Replace([]*model.Artist{&artist})
+	found, albums, err := s.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.Name != "Radiohead" {
+		t.Fatalf("unexpected name: %s", found.Name)
+	}
+	if len(albums) != 1 {
+		t.Fatalf("expected 1 album, got %d", len(albums))
+	}
+}
+
+func TestGetArtistNotFound(t *testing.T) {
+	s := testStore(t)
+	_, _, err := s.GetArtist(9999)
+	if err == nil {
+		t.Fatal("expected error for missing artist")
+	}
+}
+
+func TestSearchArtists(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Artist{Name: "Radiohead", NameNorm: "radiohead"})
+	db.Create(&model.Artist{Name: "Björk", NameNorm: "bjork"})
+	results, err := s.SearchArtists("radio", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Name != "Radiohead" {
+		t.Fatalf("unexpected results: %+v", results)
+	}
+}
+
+func TestGetArtistsByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+
+	seedArtistTrack(t, s, lib1.ID, "Alpha", "/l1/1.mp3")
+	seedArtistTrack(t, s, lib2.ID, "Beta", "/l2/2.mp3")
+	seedArtistTrack(t, s, lib1.ID, "Gamma", "/l1/3.mp3")
+
+	got, err := s.GetArtists(&store.ArtistsFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected Alpha + Gamma, got %d: %+v", len(got), got)
+	}
+
+	all, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 artists with nil filter, got %d", len(all))
+	}
+}
+
+func TestGetArtistAlbumCountsByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+
+	artist := model.Artist{Name: "Alpha", NameNorm: "alpha"}
+	db.Create(&artist)
+
+	alb1 := model.Album{Name: "A1", NameNorm: "a1", AlbumArtistNorm: "alpha"}
+	alb2 := model.Album{Name: "A2", NameNorm: "a2", AlbumArtistNorm: "alpha"}
+	db.Create(&alb1)
+	db.Create(&alb2)
+	_ = db.Model(&alb1).Association("Artists").Replace([]*model.Artist{&artist})
+	_ = db.Model(&alb2).Association("Artists").Replace([]*model.Artist{&artist})
+
+	db.Create(&model.Track{AlbumID: alb1.ID, ScanFolder: "L1", Filename: "1.mp3", FilePath: "/l1/1.mp3"})
+	db.Create(&model.Track{AlbumID: alb2.ID, ScanFolder: "L2", Filename: "2.mp3", FilePath: "/l2/2.mp3"})
+
+	counts, err := s.GetArtistAlbumCounts(&store.ArtistsFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[artist.ID] != 1 {
+		t.Fatalf("expected 1 album in library 1, got %d", counts[artist.ID])
+	}
+}
+
+func TestSearchArtistsByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+
+	a1 := model.Artist{Name: "Alpha", NameNorm: "alpha"}
+	a2 := model.Artist{Name: "Alphonse", NameNorm: "alphonse"}
+	db.Create(&a1)
+	db.Create(&a2)
+
+	album := model.Album{Name: "X", NameNorm: "x", AlbumArtistNorm: "x"}
+	db.Create(&album)
+	t1 := model.Track{AlbumID: album.ID, ScanFolder: "L1", Filename: "1.mp3", FilePath: "/l1/1.mp3"}
+	t2 := model.Track{AlbumID: album.ID, ScanFolder: "L2", Filename: "2.mp3", FilePath: "/l2/2.mp3"}
+	db.Create(&t1)
+	db.Create(&t2)
+	_ = db.Model(&t1).Association("Artists").Replace([]*model.Artist{&a1})
+	_ = db.Model(&t2).Association("Artists").Replace([]*model.Artist{&a2})
+
+	got, err := s.SearchArtists("alph", 10, 0, &store.SearchFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "Alpha" {
+		t.Fatalf("expected Alpha only, got %+v", got)
+	}
+}
+
+func TestSetArtistMBID(t *testing.T) {
+	s := testStore(t)
+	artists, _, err := s.FindOrCreateArtists([]string{"Nirvana"}, []string{""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist := artists[0]
+
+	newMbid := "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+	if err := s.SetArtistMBID(artist.ID, newMbid); err != nil {
+		t.Fatalf("SetArtistMBID: %v", err)
+	}
+
+	updated, _, err := s.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.MBArtistID != newMbid {
+		t.Fatalf("expected MBArtistID %q, got %q", newMbid, updated.MBArtistID)
+	}
+}
+
+func TestSetArtistMBIDClear(t *testing.T) {
+	s := testStore(t)
+	artists, _, err := s.FindOrCreateArtists([]string{"Nirvana"}, []string{"old-mbid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artist := artists[0]
+
+	if err := s.SetArtistMBID(artist.ID, ""); err != nil {
+		t.Fatalf("SetArtistMBID: %v", err)
+	}
+
+	updated, _, err := s.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.MBArtistID != "" {
+		t.Fatalf("expected MBArtistID cleared, got %q", updated.MBArtistID)
+	}
+}
+
+func TestFindOrCreateArtists_TagOverwritesDifferingMBID(t *testing.T) {
+	s := testStore(t)
+	// Create with an initial MBID.
+	err := s.Transaction(func(tx *store.Store) error {
+		_, _, e := tx.FindOrCreateArtists([]string{"Muse"}, []string{"mbid-old"})
+		return e
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rescan finds the same artist with a corrected MBID.
+	var got, gained []*model.Artist
+	err = s.Transaction(func(tx *store.Store) error {
+		var e error
+		got, gained, e = tx.FindOrCreateArtists([]string{"Muse"}, []string{"mbid-new"})
+		return e
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].MBArtistID != "mbid-new" {
+		t.Fatalf("expected overwrite to mbid-new, got %q", got[0].MBArtistID)
+	}
+	// An MBID change (not a gain) must NOT be reported in the gained list, because
+	// it could be a mistaken match being corrected, not a rename.
+	if len(gained) != 0 {
+		t.Fatalf("expected empty gained list for an MBID change, got %d entries", len(gained))
+	}
+}
+
+// seedArtistTrack creates an artist with one track in the given library,
+// credited both on the track and on its album, mirroring a regular
+// (non-compilation) scan result.
+func seedArtistTrack(t *testing.T, s *store.Store, libID uint, artistName, file string) *model.Artist {
+	t.Helper()
+	artists, _, err := s.FindOrCreateArtists([]string{artistName}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	albumName := "Album of " + artistName
+	ident := store.AlbumIdentity{Name: albumName, NameNorm: unidecode.Normalize(albumName), AlbumArtistNorm: artistName, MBReleaseID: ""}
+	album, err := s.FindOrCreateAlbum(ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB().Model(album).Association("Artists").Replace(artists); err != nil {
+		t.Fatal(err)
+	}
+	track := &model.Track{AlbumID: album.ID, ScanFolder: scanFolderOf(t, s, libID), Title: file, FilePath: file, Filename: file}
+	if err := s.UpsertTrack(track, artists, nil); err != nil {
+		t.Fatal(err)
+	}
+	return artists[0]
+}
+
+// seedGuestAppearance creates an album owned by ownerName (album_artists credit)
+// with one track in libID credited to guestName only (track_artists), mirroring
+// how the scanner records a featured artist or compilation contributor.
+func seedGuestAppearance(t *testing.T, s *store.Store, libID uint, albumName, ownerName, guestName, file string) (owner, guest *model.Artist, album *model.Album) {
+	t.Helper()
+	db := s.DB()
+	owners, _, err := s.FindOrCreateArtists([]string{ownerName}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guests, _, err := s.FindOrCreateArtists([]string{guestName}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := store.AlbumIdentity{Name: albumName, NameNorm: unidecode.Normalize(albumName), AlbumArtistNorm: ownerName, MBReleaseID: ""}
+	album, err = s.FindOrCreateAlbum(ident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(album).Association("Artists").Replace(owners); err != nil {
+		t.Fatal(err)
+	}
+	track := &model.Track{AlbumID: album.ID, ScanFolder: scanFolderOf(t, s, libID), Title: file, FilePath: file, Filename: file}
+	if err := s.UpsertTrack(track, guests, nil); err != nil {
+		t.Fatal(err)
+	}
+	return owners[0], guests[0], album
+}
+
+func TestGetArtistsExcludesTrackOnlyGuestArtists(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedGuestAppearance(t, s, lib.ID, "Fired Up", "Alesha Dixon", "Asher D", "/l1/1.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 1 || artists[0].Name != "Alesha Dixon" {
+		t.Fatalf("expected only the album artist in the index, got %+v", artists)
+	}
+
+	filtered, err := s.GetArtists(&store.ArtistsFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 1 || filtered[0].Name != "Alesha Dixon" {
+		t.Fatalf("expected only the album artist in the filtered index, got %+v", filtered)
+	}
+}
+
+func TestGetArtistsByLibraryIncludesAlbumArtistWithoutTrackCredits(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	// Compilation shape: album credited to Various Artists, tracks credited to guests.
+	seedGuestAppearance(t, s, lib.ID, "Cyberpunk 2077", "Various Artists", "P.T. Adamczyk", "/l1/1.mp3")
+
+	filtered, err := s.GetArtists(&store.ArtistsFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 1 || filtered[0].Name != "Various Artists" {
+		t.Fatalf("expected Various Artists in the filtered index, got %+v", filtered)
+	}
+}
+
+func TestGetArtistReturnsAlbumsTheArtistAppearsOn(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	_, guest, album := seedGuestAppearance(t, s, lib.ID, "Fired Up", "Alesha Dixon", "Asher D", "/l1/1.mp3")
+
+	_, albums, err := s.GetArtist(guest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 1 || albums[0].ID != album.ID {
+		t.Fatalf("expected the guest's appearance album, got %+v", albums)
+	}
+}
+
+func TestGetArtistAlbumCountsIncludesAppearances(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	owner, guest, _ := seedGuestAppearance(t, s, lib.ID, "Fired Up", "Alesha Dixon", "Asher D", "/l1/1.mp3")
+
+	counts, err := s.GetArtistAlbumCounts(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[owner.ID] != 1 {
+		t.Fatalf("expected owner album count 1, got %d", counts[owner.ID])
+	}
+	if counts[guest.ID] != 1 {
+		t.Fatalf("expected guest appearance count 1, got %d", counts[guest.ID])
+	}
+
+	filtered, err := s.GetArtistAlbumCounts(&store.ArtistsFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered[guest.ID] != 1 {
+		t.Fatalf("expected guest appearance count 1 in library filter, got %d", filtered[guest.ID])
+	}
+}
+
+func TestGetArtistsExcludesHiddenLibraries(t *testing.T) {
+	s := testStore(t)
+	vis := &model.Library{Name: "Vis", Filters: scanFolderFilter("Vis")}
+	hid := &model.Library{Name: "Hid", Filters: scanFolderFilter("Hid"), HideFromArtistIndex: true}
+	if err := s.CreateLibrary(vis); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateLibrary(hid); err != nil {
+		t.Fatal(err)
+	}
+	seedArtistTrack(t, s, vis.ID, "Visible Artist", "/vis/a.mp3")
+	seedArtistTrack(t, s, hid.ID, "Hidden Artist", "/hid/b.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 1 || artists[0].Name != "Visible Artist" {
+		t.Fatalf("expected only Visible Artist, got %+v", artists)
+	}
+}
+
+// Two libraries hidden from the artist index: the visibility predicate carries
+// one bind value per library and appears twice in the SQL, so the args must
+// line up in both.
+func TestGetArtistsExcludesArtistsOfSeveralHiddenLibraries(t *testing.T) {
+	s := testStore(t)
+	vis := &model.Library{Name: "Vis", Filters: scanFolderFilter("Vis")}
+	hid1 := &model.Library{Name: "Hid1", Filters: scanFolderFilter("Hid1"), HideFromArtistIndex: true}
+	hid2 := &model.Library{Name: "Hid2", Filters: scanFolderFilter("Hid2"), HideFromArtistIndex: true}
+	for _, lib := range []*model.Library{vis, hid1, hid2} {
+		if err := s.CreateLibrary(lib); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedArtistTrack(t, s, vis.ID, "Visible", "/vis/a.mp3")
+	seedArtistTrack(t, s, hid1.ID, "Hidden One", "/hid1/a.mp3")
+	seedArtistTrack(t, s, hid2.ID, "Hidden Two", "/hid2/a.mp3")
+	// Present in both hidden libraries and nowhere else: still hidden.
+	seedArtistTrack(t, s, hid1.ID, "Both Hidden", "/hid1/b.mp3")
+	seedArtistTrack(t, s, hid2.ID, "Both Hidden", "/hid2/b.mp3")
+	// One track in a visible library keeps the artist visible.
+	seedArtistTrack(t, s, hid2.ID, "Shared", "/hid2/c.mp3")
+	seedArtistTrack(t, s, vis.ID, "Shared", "/vis/c.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(artists))
+	for _, a := range artists {
+		names = append(names, a.Name)
+	}
+	if want := []string{"Shared", "Visible"}; !slices.Equal(names, want) {
+		t.Fatalf("visible artists = %v, want %v", names, want)
+	}
+}
+
+// A library hidden from the artist index with no filters covers the whole
+// catalog; honouring it would blank the entire artist index. Validation refuses
+// to store one, and the store ignores one that slipped past it.
+func TestHiddenLibraryWithoutFiltersHidesNobody(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "All", HideFromArtistIndex: true}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedArtistTrack(t, s, lib.ID, "Visible Artist", "/all/a.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 1 || artists[0].Name != "Visible Artist" {
+		t.Fatalf("expected the artist to remain visible, got %+v", artists)
+	}
+}
+
+// filteredArtist describes one artist's whole presence in the catalog: one
+// album — whose compilation flag and release types the album-level clauses of a
+// scope reach through a correlated subquery — and one track per file, whose
+// path and genre the track-level clauses test directly.
+type filteredArtist struct {
+	name         string
+	compilation  bool
+	releaseTypes []string
+	genre        *model.Genre // nil = untagged
+	files        []string
+}
+
+// seedFilteredArtist inserts that shape, crediting the artist on the album
+// (album_artists, what the artist index joins) and on every track
+// (track_artists) — the two halves excludeHiddenArtists tests separately.
+func seedFilteredArtist(t *testing.T, s *store.Store, spec filteredArtist) {
+	t.Helper()
+	db := s.DB()
+	artist := model.Artist{Name: spec.name, NameNorm: unidecode.Normalize(spec.name)}
+	if err := db.Create(&artist).Error; err != nil {
+		t.Fatal(err)
+	}
+	albumName := spec.name + " LP"
+	album := model.Album{
+		Name:            albumName,
+		NameNorm:        unidecode.Normalize(albumName),
+		AlbumArtistNorm: unidecode.Normalize(spec.name),
+		Compilation:     spec.compilation,
+		ReleaseTypes:    spec.releaseTypes,
+	}
+	if err := db.Create(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&album).Association("Artists").Replace([]*model.Artist{&artist}); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range spec.files {
+		track := model.Track{AlbumID: album.ID, Title: file, Filename: file, FilePath: file}
+		if err := db.Create(&track).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&track).Association("Artists").Replace([]*model.Artist{&artist}); err != nil {
+			t.Fatal(err)
+		}
+		if spec.genre == nil {
+			continue
+		}
+		if err := db.Model(&track).Association("Genres").Replace([]*model.Genre{spec.genre}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestHiddenArtistsWithMultiClauseFilters drives excludeHiddenArtists with the
+// arbitrary SQL a library scope really compiles to, not the single scan_folder
+// clause every other hidden-artist test uses: correlated album subqueries, a
+// json_each release-type test, a two-directory path range — and, crucially, an
+// UNEVEN number of bind values per library (six for Curated, two for Plain).
+// The visibility predicate is rendered twice, once per presence join, so its
+// args have to be appended twice in the same order; getting that wrong shifts
+// every value and either errors or silently hides the wrong artists.
+//
+//	Curated = {genre: [Jazz]} AND {compilation: true} AND {path: [/vault/a, /vault/b]}
+//	Plain   = {compilation: false} AND {release_type: ["", "Single"]}
+func TestHiddenArtistsWithMultiClauseFilters(t *testing.T) {
+	s := testStore(t)
+	jazz := model.Genre{Name: "Jazz"}
+	if err := s.DB().Create(&jazz).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, lib := range []*model.Library{
+		{Name: "Curated", HideFromArtistIndex: true, Filters: []model.LibraryFilter{
+			{Field: model.FilterGenre, Values: []string{"Jazz"}},
+			{Field: model.FilterCompilation, Values: []string{"true"}},
+			{Field: model.FilterPath, Values: []string{"/vault/a", "/vault/b"}},
+		}},
+		{Name: "Plain", HideFromArtistIndex: true, Filters: []model.LibraryFilter{
+			{Field: model.FilterCompilation, Values: []string{"false"}},
+			{Field: model.FilterReleaseType, Values: []string{"", "Single"}},
+		}},
+	} {
+		if err := s.CreateLibrary(lib); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, spec := range []filteredArtist{
+		// Everything this artist has is inside Curated: all three clauses hold.
+		{name: "Hidden Comp", compilation: true, genre: &jazz, files: []string{"/vault/a/1.flac"}},
+		// Inside Plain by its typed release type, and by its untyped one — the
+		// branch of releaseTypeClause that contributes SQL but no bind value.
+		{name: "Hidden Single", releaseTypes: []string{"Single"}, files: []string{"/elsewhere/2.mp3"}},
+		{name: "Hidden Untyped", files: []string{"/elsewhere/3.mp3"}},
+		// One track inside Curated, one outside every scope: still visible.
+		{name: "Visible Outside", compilation: true, genre: &jazz, files: []string{"/vault/b/4.flac", "/other/4.flac"}},
+		// Matches Curated's genre and path but not its compilation clause, and
+		// Plain's compilation clause but not its release type: a scope is the
+		// AND of its filters, so matching some of them selects nothing.
+		{name: "Visible Partial", releaseTypes: []string{"Album"}, genre: &jazz, files: []string{"/vault/a/5.flac"}},
+	} {
+		seedFilteredArtist(t, s, spec)
+	}
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(artists))
+	for _, a := range artists {
+		names = append(names, a.Name)
+	}
+	if want := []string{"Visible Outside", "Visible Partial"}; !slices.Equal(names, want) {
+		t.Fatalf("visible artists = %v, want %v", names, want)
+	}
+}
+
+// A hidden library whose filters the compiler cannot honor resolves to
+// NoTracks, not to the whole catalog — ScopeOf fails closed. Negated, that is
+// "NOT (1 = 0)", so such a library hides nobody. Validation refuses to store
+// one; this is what happens to one that reached the table anyway, and it is the
+// opposite failure mode from the zero-filter case
+// (TestHiddenLibraryWithoutFiltersHidesNobody), which is skipped outright.
+func TestHiddenLibraryThatCompilesToNothingHidesNobody(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "Broken", HideFromArtistIndex: true, Filters: []model.LibraryFilter{
+		{Field: "mood", Values: []string{"x"}},
+	}}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	seedArtistTrack(t, s, lib.ID, "Visible Artist", "/broken/a.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 1 || artists[0].Name != "Visible Artist" {
+		t.Fatalf("expected the artist to remain visible, got %+v", artists)
+	}
+}
+
+// A failing lookup must not turn into "show every artist": that is failing open
+// on the one privacy-ish knob libraries have.
+func TestGetArtistsFailsWhenTheHiddenLibrariesCannotBeRead(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	artist := model.Artist{Name: "Radiohead", NameNorm: "radiohead"}
+	db.Create(&artist)
+	album := model.Album{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead"}
+	db.Create(&album)
+	_ = db.Model(&album).Association("Artists").Replace([]*model.Artist{&artist})
+
+	if err := db.Migrator().DropTable(&model.Library{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.GetArtists(nil); err == nil {
+		t.Fatal("expected an error when the hidden-artist libraries table cannot be read")
+	}
+}
+
+func TestGetArtistsKeepsArtistsSharedWithVisibleLibrary(t *testing.T) {
+	s := testStore(t)
+	vis := &model.Library{Name: "Vis", Filters: scanFolderFilter("Vis")}
+	hid := &model.Library{Name: "Hid", Filters: scanFolderFilter("Hid"), HideFromArtistIndex: true}
+	if err := s.CreateLibrary(vis); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateLibrary(hid); err != nil {
+		t.Fatal(err)
+	}
+	seedArtistTrack(t, s, vis.ID, "Shared Artist", "/vis/a.mp3")
+	seedArtistTrack(t, s, hid.ID, "Shared Artist", "/hid/b.mp3")
+
+	artists, err := s.GetArtists(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artists) != 1 || artists[0].Name != "Shared Artist" {
+		t.Fatalf("expected Shared Artist to stay visible, got %+v", artists)
+	}
+}

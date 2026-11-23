@@ -1,0 +1,489 @@
+# Authentication — decided model, do not re-design
+
+Current state: **both authenticated modes are implemented.** Auth method
+`native` (the builtin mode): JSON login + logout on `/api/v0/auth/*`, a cookie
+session guard on the rest of `/api/v0`, and a full-app login gate in the SPA.
+Auth method `proxy-header`: a reverse proxy (e.g. Authelia) authenticates and
+injects identity headers, `headerGuard` (`app/router/proxy_auth.go`) validates
+them (optionally against `TrustedProxies` CIDRs), provisions users on first
+sight, and derives the role live from the groups header — see the mode section
+below. Roles
+are **enforced on `/api/v0`**: a public bootstrap set, then a session-scoped
+tier (`/api/v0/auth/token`, `/api/v0/auth/tokens[/*]`) accepting any
+authenticated role, and the rest defaulting to *admin* (403 otherwise) — the
+whole surface is server administration. The SPA mirrors this via `role` in
+`/me` (`useAuth().isAdmin` hides the Admin menu entry, the artist-image editor
+and radio Discover, and redirects non-admins out of `/settings`). `/rest`
+authenticates exclusively via PATs, in two forms: OpenSubsonic `apiKey` (any
+PAT presented whole) and the standard Subsonic password flows (`u`+`t`+`s`
+salted token, or `u`+`p`), where `u` is a **usertoken** PAT's tokenID acting
+as a virtual username — never a real login. Error codes: 40 wrong or missing
+credentials, 41 token auth not supported for this user (real login or
+apikey-only id presented via `t`/`p`), 43 `apiKey` mixed with
+`u`/`p`/`t`/`s`, 44 invalid apiKey, 0 verifier I/O failure. Every
+per-user surface — queue, stars, playlists, history — is owner-scoped. The
+SPA mints a 48h `spa`-scoped token via `POST /api/v0/auth/token` on boot
+(session-scoped guard tier, token in memory only) and re-mints transparently
+on expiry (one retry per subsonic call), recovering playback streams via the
+audio element's error listener. Users create long-lived `client`-scoped tokens
+in the settings UI (UserSettingsView, native mode only). The old Sec-Fetch-Site
+CSRF mitigation is removed — tokens on `/rest` moot the concern. The plan
+below is decided (TODO.md, top section) — implement it, don't invent
+alternatives.
+
+## The (Open)Subsonic auth methods (protocol recap)
+
+Everything rides on query parameters; there is no standard header/Bearer/
+cookie auth in the protocol:
+
+1. **Plaintext** — `u` + `p=<password>` (or `p=enc:<hex>`, obfuscation not
+   encryption). Legacy, deprecated since API 1.13.0, still widely used.
+2. **Salted token** — `u` + `t=md5(secret+salt)` + `s=<client-chosen salt>`,
+   fresh salt per request. The de-facto standard for current clients
+   (Symfonium, DSub, Ultrasonic). Forces the server to hold a **recoverable**
+   secret — hash-only storage cannot recompute the MD5; the algorithm is
+   fixed, no negotiation. Aether satisfies this via usertoken PATs: the secret
+   is a per-app token encrypted at rest (AES-256-GCM, key in
+   `<DataDir>/pat.keys`, AAD-bound to the tokenID), never the login password.
+3. **API key** — `apiKey=<key>` alone (OpenSubsonic 2024 extension,
+   advertised as `apiKeyAuthentication`). Fail-closed: mixing with password
+   params is error 43, invalid key error 44, no fallback. Server can store
+   only `sha256(key)`, but client adoption is thin — an apiKey-only server
+   locks out most current clients.
+
+## The architecture in one paragraph
+
+Two auth *modes* — **native** (builtin login + aether session cookie) and
+**proxy-header** (Authelia in front) — differ only in **who establishes
+identity for the SPA and `/api/v0`**. Everything downstream is shared and
+mode-agnostic: the user table, the PAT system, the token-mint endpoint, and
+the `/rest` verifier. **`/rest` is Subsonic-token-only in every mode** — no
+cookies, no headers on that surface — so the SPA is just another Subsonic
+client that happens to obtain its credential automatically. Auth handlers
+compose with OR semantics via `go-bumbu/userauth` (`handlers/auth/chain`).
+
+## Shared machinery (built once, used by both modes)
+
+- **Multi-user table** (playlist `Owner` and the per-entity star direction
+  are pre-wired — see architecture.md). Roles are **implemented** on top of
+  `userauth` group memberships (`userdb` `user_groups` table): membership in
+  the `admin` group (`users.AdminGroup`) makes a user an admin; a user with
+  no groups is a regular user. The users CRUD exposes this as a `role`
+  field (`"admin"`/`"user"`) and the bootstrapped initial admin is seeded
+  into the group. The `/api/v0` guard enforces the admin role (see below).
+  On `/rest`, the spec's admin-only endpoints (radio CRUD writes) are gated
+  via `subsonic.WithAdminChecker`: the router injects `restAdminChecker`
+  (owner login → `users.RoleOf`), handlers call `requireAdmin` (Subsonic
+  error 50). nil checker (auth "none") passes everyone. Proxy mode mirrors
+  the header-derived role into the DB groups on every `/api/v0` request
+  (`resolveProxyIdentity`) so the DB-only `/rest` checker agrees with the
+  IdP — `/rest` is proxy-bypassed and carries no identity headers.
+- **PAT system** — per-user tokens verified by an `IdentityResolver` the
+  router injects into `subsonic.Register`
+  (`MainAppHandler.patIdentityResolver`, `app/router/main.go`). It resolves
+  two flows: **`apiKey`** → `pat.Verify` (any PAT, hash-only check);
+  **`u`+`t`+`s`** or **`u`+`p`** → `pat.VerifyMatch` with an MD5/plaintext
+  matcher, where `u` is resolved as a tokenID (case-normalized) and the
+  real-login check serves only to distinguish error 41 (token auth unsupported
+  for this user: real login or apikey-only id presented via `t`/`p`) from 40
+  (wrong credentials). Mixing `apiKey` with `u`/`p`/`t`/`s` is error 43. This
+  is the *only* authentication on `/rest`.
+- **Token-mint endpoint** — `POST /api/v0/auth/token` (**implemented**,
+  `handlers/tokens`; `/api/v0` is the right home — it's not a music
+  feature). Exchanges
+  "whoever the `/api/v0` middleware says you are" for a Subsonic token
+  bound to that user. Its identity comes from an injected `Caller` resolver
+  (the seam): native wires `sessionCaller` (cookie), proxy-header wires
+  `proxyCaller` (the guard's context identity) — same handler, zero mode
+  branching. It trusts **only** the middleware identity; no fallback auth of
+  any kind (it's the most sensitive endpoint in the model).
+- **`/api/v0/me`** — **implemented** (`handlers.MeHandler`): returns
+  `{authMethod, user, features}` so the SPA can show identity, gate
+  feature UI, and pick the right 401 reaction without build-time config.
+  `user` carries the session's identity (`{login, role}`), null when
+  anonymous; `role` is the derived vertical (`"admin"`/`"user"`, see
+  handlers/users `RoleOf`) the SPA gates admin UI on;
+  `features.userManagement` reports whether the users CRUD is mounted
+  (auth method "native"). The endpoint is deliberately public — the SPA
+  bootstraps on it before any login — and it renews the rolling session
+  expiry of remember-me sessions.
+- **SPA token lifecycle** — on boot, mint a 48h `spa`-scoped token via
+  `POST /api/v0/auth/token`, posting `{deviceId, deviceName}` for the app
+  instance doing the minting (**one session per device, not per user** — below);
+  keep it in memory only (never localStorage). Speak standard Subsonic auth on
+  `/rest` via `apiKey=<token>`. The SPA's own `spa`-scoped token is hash-only
+  by design, so `apiKey` is its only transport; `usertoken` PATs (recoverable,
+  encrypted-at-rest) serve `t`+`s` and `p` clients. On token expiry
+  (subsonic error 40/44), re-mint transparently (single-flight, one retry per
+  call); if the mint call itself 401s, the *session* is gone → mode-specific
+  reaction (below). Surface "session expired" in the player instead of a
+  generic error when a stream's next range request fails. Generation counter
+  (the subsonic client's, bumped by every session reset) discards mints
+  resolving after a logout, an expiry or a server switch — their success and
+  their refusal alike — and the reset lets go of such a mint, so the next
+  session mints its own. A `/rest` 40/44 answering a request sent before the
+  reset is discarded the same way: no mint, no retry (which would rebuild the
+  old request's URL, perhaps another server's, with the new session's key), no
+  expiry. The generation check keeps `remintApiKey` itself from flagging an
+  expiry for a stale mint, but the `/api/v0` interceptor still flags a 401
+  that came from the configured server.
+
+**One session per device.** The same user may be signed in from several
+first-party Aether apps at once — browsers today, native apps later — so a `spa`
+token belongs to a *device*, not to a user. Each app instance generates a stable
+device id on first use and persists it under `aether:deviceId`
+(`webui/src/lib/deviceIdentity.ts`) — the one localStorage key the logout purge
+deliberately preserves, since it identifies the app instance rather than the
+user; wiping it would orphan that instance's server-side session on every
+logout/login cycle. The id rides a `device:<id>` scope alongside `spa`, and the
+mint (`app/router/handlers/tokens/tokens.go`) sweeps only:
+
+- every **expired** `spa` token of the caller, whatever device it came from;
+- the **live token bearing this device's scope**, which this mint supersedes —
+  so repeated boots of one app never pile up or exhaust the cap;
+- the least recently used sessions beyond `MaxSessionsPerUser` (10), so
+  per-device sessions cannot crowd the user's client PATs out of the `pat`
+  service's per-user budget (LRU by `LastUsedAt`, falling back to `CreatedAt`).
+
+Other apps' live sessions survive, which is what keeps one app signing in from
+signing another out. `deviceId` is required and validated (1–64 chars of
+`[A-Za-z0-9_-]`, no `:` so it cannot forge a scope) — a bad one is a 400.
+`deviceName` is cosmetic ("Firefox on Linux", derived from the UA; "Aether
+Player on Linux" in the desktop app), truncated to 100 runes rather than
+rejected, and falls back to `aether-web`; it is the row label in User settings
+→ Connected apps → Your Aether apps.
+
+**The desktop app runs the same native flow**, or a `/rest`-only key session
+(`player/`, the SPA as its window). Its `/api/v0` and `/rest` requests leave
+from Rust through `tauri-plugin-http`, whose cookie jar
+(`app_cache_dir()/.cookies`, saved as cookies are set) holds the session cookie
+— the webview itself could not send it: every request from its `tauri://`
+origin is cross-site and the cookie is `SameSite=Lax`. So login, `/me`, the
+boot mint and the per-device sweep run unchanged, with no server-side branch,
+and `getDeviceName()` names the app ("Aether Player on <platform>",
+`webui/src/lib/deviceIdentity.ts`) rather than the webview's browser. The
+minted `spa` token is also handed to the player's Rust client, in memory only
+(`set_session`, inside the mint's generation check), and withdrawn on logout,
+expiry and a server switch; the player stores no password. **A key session
+needs none of this**: the user pastes a PAT created under User settings →
+Connected apps, the login view verifies it with `getUser` and Rust stores it
+owner-only (`credentials.json`); identity and role come from `getUser`
+(`username`, `adminRole`), `/me` is never asked, the mint never runs, and the
+SPA's `/api/v0` client refuses to send. That is what lets the app use a server
+behind Authelia, whose ACL bypasses `/rest` and keeps `/api/v0` closed to it:
+the server step recognises such a server with a two-step probe — `/api/v0/me`,
+then the bypassed `/rest/ping`, whose error envelope carries Aether's
+`type: "Aether"` — and saves it as a key session
+([frontend.md](frontend.md#desktop-app-mode-libhost)). A `/rest` error 40 or 44
+in a key session means the key was revoked or has expired: the SPA forgets it
+and asks for another. Revoking stays in the web UI; administering a portal
+server from inside the app is the narrowed follow-up in TODO.md.
+
+Token classes — implemented in `userauth`'s `pat` service with a `scope` tag
+distinguishing behavior:
+
+| | SPA-minted (`spa` scope) | User-created PAT: `apikey` | User-created PAT: `usertoken` |
+|---|---|---|---|
+| Created | automatically on SPA boot | manually via POST /api/v0/auth/tokens | manually via POST /api/v0/auth/tokens |
+| Lifetime | 48h, re-minted transparently | long-lived until revoked | long-lived until revoked |
+| Management UI | listed as `kind: "session"`, one row per app instance, revocable | listed, named, revocable in UserSettingsView | listed, named, revocable; shows type tag |
+| Storage | hash-only (we control the client) | hash-only | recoverable (AES-256-GCM encrypted at rest) |
+| Transport | `apiKey` only | `apiKey` only | `apiKey`, or `u`+`t`+`s`/`p` with tokenID as virtual username |
+| Credential shown | token at mint time | token at mint time | Username + Password at mint time (copy buttons in UI) |
+
+The users CRUD refuses logins matching `^[0-9a-z]{10}$` (virtual-username
+collision with tokenIDs). SPA `spa` tokens are always hash-only and
+apiKey-shaped regardless of user PAT settings.
+
+### Residual risk
+
+The Subsonic password flows (`u`+`t`+`s` and `u`+`p`) are replayable by
+design: the client chooses the salt (no nonce), and there is no expiry bound
+within the request itself. Over plain HTTP, a captured request grants durable
+access to that token until revoked. Mitigations: **use HTTPS for anything
+beyond a trusted LAN**; per-app tokens (usertoken PATs) limit the blast
+radius of a compromised credential to one device; revocation is the incident
+response. Credential parameters (`t`/`s`/`p`/`apiKey` values) are masked in
+request logs (`u` remains visible as the tokenID).
+
+Error code 41 deliberately distinguishes "existing login presented via `t`/`p`"
+from unknown virtual username (40) — a login-existence oracle accepted for
+client UX (so clients can show "configure a token" instead of "wrong password"),
+mirroring the tokenID oracle the `pat` library warns about.
+
+Mint-time sweep is per-device (see "One session per device" above);
+`GET /api/v0/auth/tokens` reports live spa tokens as `kind: "session"` and drops
+expired ones. A boot mint that gets no answer at all (`remintApiKey` →
+`unreachable`) is not a verdict on the session: it raises the connectivity
+banner, spends no retry budget, and the credential watcher mints again once
+the banner's probe finds the server (`onReconnect` in `useAuth.ts`) — the login
+gate's purge would empty the queue over a network blip. A boot mint that
+keeps failing for a non-401 reason surfaces the login gate, whose purge refetches
+`/me` and re-runs the mint watcher — so the SPA caps consecutive failed mints
+(`MAX_MINT_ATTEMPTS` in `webui/src/lib/subsonicSession.ts`) and then leaves the
+gate up instead of looping. A successful login or mint re-arms the budget.
+
+Why token-only on `/rest` instead of also chaining the session cookie there:
+one auth path on the most compliance-sensitive surface in both modes (halves
+the test matrix), and CSRF vanishes from `/rest` — Subsonic is full of
+GET-with-side-effects (`star`, `deletePlaylist`), which a cookie-authenticated
+API would have to defend; tokens moot it. Only `/api/v0` needs CSRF thought.
+
+## Mode: native (builtin login) — session layer implemented
+
+Aether is its own identity provider — a built-in equivalent of the Authelia
+path. `userauth` ships every piece: `flow/login` + `flow/login/handlers.JSON`
+(the JSON login transport over a password-only policy; TOTP 2FA can be added
+to the same flow later), `cookieauth.Manager` (gorilla-sessions cookie;
+implements the chain `AuthHandler` interface; `LoginUser`/`LogoutUser`;
+handlers read identity via `cookieauth.CtxGetUserData`), and
+`userstore/userdb` (GORM-backed user store on aether's SQLite).
+
+| Surface | Protected by |
+|---|---|
+| `/` (SPA shell) | open (login view is part of the SPA) |
+| `/api/v0/auth/login`, `/logout` | the login handler itself |
+| `/api/v0` (rest of it) | `cookieauth` session cookie, three tiers: public bootstrap (`/me`, `/health`, `/version`), session-scoped (`/api/v0/auth/token`, `/api/v0/auth/tokens[/*]` — any authenticated role), and admin default (`sessionGuard` in `app/router/api_v0.go`) |
+| `/rest` | Subsonic PAT verifier (apiKey, or u+t+s / u+p against usertoken PATs) — errors 40/41/43/44 |
+
+Implementation notes (`app/router/handlers/auth`, `app/cmd/session.go`):
+
+- `POST /api/v0/auth/login` takes `{username, password, sessionRenew}` and
+  answers `{done:true}` with the cookie set, or a uniform 401 for every
+  credential-shaped failure. `sessionRenew` is the "remember me" bit: it opts
+  the session into rolling renewal (24h window renewed on activity, 30-day
+  hard cap) instead of the fixed 24h window.
+- Cookie keys are generated once and persisted in `<DataDir>/session.keys`
+  so sessions survive restarts; the cookie is `SameSite=Lax`, not `Secure`,
+  because aether commonly runs plain-HTTP on a LAN.
+- The SPA gate lives in `App.vue` + `useAuth()`: `/me` bootstraps, the login
+  view replaces the whole app (not a route) while `authMethod` is `native`
+  and `user` is null (in the desktop app also while no server is chosen or
+  the chosen one does not answer as Aether, while a key session has no key,
+  and on a proxy-header server — see
+  [frontend.md](frontend.md#desktop-app-mode-libhost)), and an axios
+  interceptor flips a shared `sessionExpired` flag on any `/api/v0` 401 (in
+  the desktop app only for a request sent to the server still configured: a
+  401 a server switch overtook speaks for a session already over) so an
+  expired session re-opens the gate mid-flight. Logout and session expiry
+  both purge the device
+  (`purgeLocalSession` in `useAuth`): stop playback (queue sync unbinds first
+  so the emptied queue is not pushed to the server), clear localStorage, and
+  reset the query cache.
+- The purge's cache reset refetches queries that now 401, so `sessionExpired`
+  ends up set after a *deliberate* logout too. `useAuth` therefore also sets
+  `explicitLogout` (in `lib/authState.ts`) when the logout starts, and the
+  login view shows its "session has expired" note on the derived
+  `sessionLostUnexpectedly` — expiry only, never a logout the user asked for.
+  Both flags clear on the next successful login.
+
+- `sessionGuard` re-reads the user row on every request and 403s a **disabled**
+  user, so the `Enabled` kill-switch closes sessions that are already open — not
+  just future logins. Without it a disabled admin kept its cookie and could
+  re-enable itself through the same API, and could still mint `/rest` tokens
+  (the check sits before the session-scoped tier for exactly that reason).
+  `/me` instead reports a disabled user as anonymous: it is public-tier, and
+  reporting no identity is what makes the SPA fall back to the login view.
+  `pat.Verify` enforces the same flag on `/rest`, so a disabled user is closed
+  out on every surface. Matches `headerGuard` in proxy mode.
+
+### Users CRUD guards (native only)
+
+Two refusals in `app/router/handlers/users/users.go` exist because of how
+identity is keyed and bootstrapped. Both are load-bearing, not defensive
+politeness:
+
+- **The last enabled admin cannot be demoted, disabled or deleted** (409,
+  code `last_admin`). `bootstrapAdmin` re-seeds only while the store is EMPTY, so
+  removing the final admin cannot be undone through the API — a restart does not
+  fix it. The break-glass recovery path is the offline `aether user role <login>
+  admin` CLI command (see below), which promotes freely; the same guard also
+  refuses a CLI demotion of the last admin (`users.IsLastEnabledAdmin`, shared
+  with the CRUD). Disabled admins do not count towards the quorum: they cannot log
+  in, so leaving one behind is the same lockout with extra steps.
+- **Renaming is refused** (400): owner-keyed data (play queue, stars, playlists,
+  history) is keyed on the login STRING, not on `User.ID` — `patIdentityResolver`
+  returns `info.LoginID` as the owner — so a rename orphans every owner-keyed row
+  under the old key. The data survives in the DB but becomes invisible to its
+  owner. `update` accepts a login field equal to the current one (the edit dialog
+  submits the field it displays) and rejects any actual change; `UserDialog.vue`
+  renders it read-only so the UI does not offer a doomed edit. Lifting this needs
+  the owner columns to key on the UUID first (TODO.md, Multi-user).
+
+Validation in `update` happens entirely before the first store write: the
+mutations are separate store calls rather than one transaction, so a late
+rejection would leave the update half-applied.
+
+**Change own password — implemented.** `PUT /api/v0/auth/password` is a
+session-tier route (any role; `apiV0SessionPath` in `app/router/api_v0.go`) in
+the auth handler (`handlers/auth/auth.go`): it re-verifies the caller's current
+password — a live session is not by itself authority to change the credential
+that mints it — with per-user brute-force backoff (a `service/throttle.Backoff`
+keyed on the `"reauth"` method, its own bucket separate from login, persisted on
+the aether DB), then hashes and stores the new one via `SetPasswordHash` and the
+shared `usersHandler.ValidPassword` rule. On success it **clears the caller's own
+session cookie** (`Sessions.LogoutUser`), so a password change signs this device
+out and the SPA drops to the login view (its success handler runs the normal
+`logout` flow); the user signs back in with the new password. Note this only
+signs out the **device that made the change**: aether's sessions are stateless
+encrypted cookies (no server-side registry — `app/cmd/session.go`), so
+`SetPasswordHash`'s revocation is a no-op and other devices' cookies stay valid
+until they expire on their own. A wrong current password is **403, not 401** — the session is still
+valid, only the re-auth check failed, and the SPA treats any `/api/v0` 401 as
+an expired session and signs the user out (`webui/src/lib/api/client.ts`); 401
+stays reserved for the guard's genuine no-session case. A throttled attempt is
+429 (`Retry-After`), an over-length new one 422. Wired only in native mode (the auth handler is not
+mounted under proxy-header, where the IdP owns credentials), and the
+UserSettingsView → Account tab (its own section, shown only in native mode when
+signed in) hosts the form, gated on `authRequired && currentUser` to
+match. `SetPasswordHash` is also reachable from the CLI
+(`aether user reset-password`) and the admin-tier `PUT /api/v0/users/{id}`.
+
+**Brute-force backoff — implemented.** `POST /api/v0/auth/login` is guarded by
+`userauth`'s login `Guard` (`flow/login.ThrottleGuard` over
+`service/throttle.Backoff`, persisted on the aether DB via
+`service/throttle/store/db` — the `login_throttle` table): after a few free
+failures per login identifier an escalating delay is required (library defaults:
+3 free failures, then 2s doubling to a 5-minute cap), so guessing is infeasible
+without locking the account out. It is an escalating delay, deliberately **not a
+hard lockout** — a lockout would let anyone who knows a login deny its owner
+access. The guard is keyed on the **raw login identifier before any credential
+work**, so submissions for unknown accounts throttle exactly like wrong
+passwords for existing ones (no account-existence oracle), and a throttled
+attempt is rendered as the same uniform 401 as a wrong password. Persisting the
+state means it survives a restart and cannot be reset by crashing the server.
+Wired in `setupAuth` (`app/cmd/users.go`) → `router.Cfg.LoginGuard` →
+`authHandler.Handler.Guard` → the login `Flow`; native mode only (proxy-header
+delegates login to the IdP, "none" has no login). Toggle with
+`Auth.LoginThrottle.Enabled` (default on; see config switch below). The flow
+still runs with a nil `AttemptStore`, which the library allows for single-factor
+policies — that store persists multi-factor progress, it is not the throttle.
+
+### Offline user management (`aether user` CLI)
+
+The `aether user` subcommands (`app/cmd/usercmd.go`) operate directly on the
+aether DB with the server stopped — the recovery and provisioning path that does
+not need a running admin session. All open the existing store via
+`openUsersStore` (the DB must already exist; they never bootstrap one) and share
+the config resolution the server uses:
+
+- `user hash [password]` — print a bcrypt hash for `Auth.AdminBootstrap.Pw`.
+- `user create <login> [password] [--admin]` — create a user; `--admin` grants
+  the admin role. Refuses a token-shaped login (`users.IsTokenShapedLogin`) and a
+  duplicate, matching the users CRUD.
+- `user list` — every user with derived role and enabled/disabled status.
+- `user role <login> admin|user` — grant/revoke admin. **This is the break-glass
+  fix for an admin lockout**: promotion is unconditional, demotion of the last
+  enabled admin is refused (`users.IsLastEnabledAdmin`, the same guard as the
+  CRUD). Together with `reset-password`, it means a lockout no longer requires
+  hand-editing the DB, and users can be prepared before switching `none` →
+  `native`. Only the "none" mode's total absence of a user store remains a gap
+  (TODO.md).
+
+## Mode: proxy-header (Authelia) — implemented
+
+A reverse proxy (Traefik/nginx/Caddy) does forward-auth against Authelia;
+authenticated requests reach aether with `Remote-User` and `Remote-Groups`
+(comma-separated) injected — header names are config
+(`Auth.ProxyHeader.UserHeader`/`GroupsHeader`, so oauth2-proxy's
+`X-Forwarded-User` is just configuration). Aether reads the headers,
+resolves/provisions the user, maps groups to roles. Authelia **replaces the
+login form, not the token layer**.
+
+| Surface | Authelia ACL | Aether validates |
+|---|---|---|
+| `/` (SPA shell) | `one_factor` | nothing — protection exists to trigger the portal redirect |
+| `/api/v0` | `one_factor` (+ group rule for admin routes) | trusts injected `Remote-*` headers |
+| `/rest` | **`bypass`** | Subsonic PAT/token verifier only |
+
+`/rest` must be bypassed: Subsonic clients authenticate via query params on
+every request, cannot perform a portal login, hold no Authelia session, and
+mostly cannot attach headers. Without the bypass every third-party client
+dies at the proxy. Consequence: on `/rest` Authelia injects nothing and
+aether must never consult identity headers there.
+
+Flow: user hits the domain → Authelia portal handles login/2FA → SPA loads
+with headers flowing on `/api/v0` → SPA mints its `/rest` token via the
+header-authorized mint endpoint. On 401 from `/api/v0` (Authelia session
+expired): full-page reload so the portal redirect kicks in (the expiry
+watcher in `useAuth` branches on `authMethod === 'proxy-header'`). Configure
+Authelia to answer non-HTML requests with 401 instead of 302 (it keys off
+`Accept`) so the SPA sees a clean failure, not portal HTML. The desktop app
+does not take this flow: behind such a portal it signs in with an API key in a
+`/rest`-only session (see "The desktop app runs the same native flow" above).
+
+Implementation (`app/router/proxy_auth.go`, `app/cmd/users.go
+setupProxyAuth`): `userauth`'s `auth/headerauth` handler validates the
+headers (configurable names, group parsing, `TrustedProxies` CIDR check) and
+`headerGuard` enforces the same three `/api/v0` tiers as native. Users are
+**JIT-provisioned** into the same `userdb` on first sight of a new login —
+the row exists so PATs have an owner `pat.Verify` can check (and its
+`Enabled` flag doubles as aether's kill-switch: a disabled user is 403'd on
+`/api/v0` and rejected on `/rest` even while the proxy still authenticates
+them); the row's password is a random throwaway. The **role is derived live
+from the groups header** (`Auth.ProxyHeader.AdminGroup`, default
+`aether-admin`) — DB groups are never consulted, the IdP is authoritative.
+Login/logout endpoints and the users CRUD are not mounted;
+`features.userManagement` reports false and the SPA hides the logout entry
+(`authRequired` is native-only) while token management stays available.
+
+### Security invariants (non-negotiable in proxy mode)
+
+1. **Aether must be unreachable except through the proxy** — anyone hitting
+   it directly can send `Remote-User: admin` and become anyone. Bind to
+   localhost / internal network; deployment docs must say this loudly.
+   `Auth.ProxyHeader.TrustedProxies` (CIDRs) adds defense in depth: when set,
+   identity headers are honored only from those peers; when empty, a loud
+   startup warning reminds that the deployment alone carries the guarantee.
+2. **The proxy must strip inbound `Remote-*` headers on every request** —
+   especially on the bypassed `/rest` path, where a malicious client could
+   smuggle them. (Aether never consults identity headers on `/rest` — the
+   guard is installed on the `/api/v0` subrouter only — but strip them
+   anyway.)
+3. `/api/v0` can additionally get a stricter Authelia policy (two_factor,
+   group-restricted) for defense in depth.
+
+## Config switch
+
+`Auth.Method`: `none` (dev / trusted LAN) / `native` / `proxy-header`
+(`app/cmd/config.go`). The switch only selects which handler guards
+`/api/v0` + the SPA shell and whether login endpoints are mounted. `/rest`
+is configured identically in all authenticated modes. `/api/v0/me` reports
+the active mode so the SPA reacts correctly to 401s.
+
+`none` is still the **shipped default**, but it may no longer bind to every
+interface: under `none` an unset `BindIp` resolves to `127.0.0.1` (a binary
+started with no config file stays on loopback instead of serving the LAN), an
+explicit wildcard (`0.0.0.0`, `::`) is a startup error, and a specific address
+— e.g. a LAN interface an auth proxy on another host reaches — is allowed
+(`getAppCfg` / `isWildcardBind` in `app/cmd/config.go`). The authenticated
+modes are unrestricted: they protect the surface themselves, so `BindIp`
+defaults to every interface there. The restriction covers the main server
+only, not the (default-off) observability server. Still open: in `none` mode
+there is no user store at all (`setupNativeAuth` returns nils), so nothing can
+be created, edited or reset until the method changes — a 1.0 decision in
+TODO.md, not settled policy.
+
+Native extras under `Auth.AdminBootstrap`: `User` / `Pw` seed the initial
+admin while the user store is empty (idempotent — `bootstrapAdmin` in
+`app/cmd/users.go`). `Pw` may be plaintext or a bcrypt hash (`$2` prefix,
+from `aether user hash`). Ignored in the other modes.
+
+`Auth.LoginThrottle.Enabled` toggles the brute-force backoff on native login
+(see "Brute-force backoff" above). It is a pointer bool: **omitted means on** —
+set it to `false` to disable. Meaningful in native mode only; proxy-header and
+`none` have no aether login to guard.
+
+Proxy-header extras under `Auth.ProxyHeader`: `UserHeader` (default
+`Remote-User`), `GroupsHeader` (default `Remote-Groups`), `AdminGroup`
+(default `aether-admin`), `TrustedProxies` (CIDR list, empty = trust every
+peer).
+
+`TrustedProxies` must list **both loopback forms** (`127.0.0.1` and `::1`)
+when the proxy is co-located: a proxy configured with the hostname
+`localhost` dials `::1` first, so a list with only `127.0.0.1` rejects its
+headers. The failure is silent and reads as a broken frontend — `/me`
+answers `200` with `"user": null`, and in proxy mode the SPA has no login
+view to fall back to, so `subsonicReady` never flips and the page stays
+blank. When debugging a blank SPA in proxy mode, curl `/api/v0/me` over
+`127.0.0.1` and `[::1]` separately: differing answers mean this.

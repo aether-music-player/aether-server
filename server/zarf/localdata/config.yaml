@@ -1,0 +1,172 @@
+# Dev config: `make run` starts the server from server/ (the Go module root)
+# with -c zarf/localdata/config.yaml. Relative paths in this file (DataDir, scan
+# folder Paths, "@" key files) resolve against that working directory, not
+# against this file's directory.
+Server:
+  Port: 8075
+  BindIp: ""
+
+# Observability endpoints (health, Prometheus metrics) on a separate server.
+# Disabled by default; set Enabled to true to start it.
+Observability:
+  Enabled: false
+  Port: 9009
+  BindIp: ""
+
+DataDir: "./zarf/localdata/data"
+
+# The directories Aether scans for music. They are declared HERE and nowhere
+# else: there is no database row and no UI to add one, so what gets scanned is
+# exactly what this list says. Restart to apply a change.
+#
+#   Name             identifies the folder: tracks remember the name of the folder
+#                    they were indexed under, and library filters refer to it.
+#                    Renaming a folder takes effect on the next scan. Libraries
+#                    whose filters name the OLD name keep matching its tracks
+#                    until that scan re-labels them, then match nothing until
+#                    they are edited: Settings → Libraries marks them "Needs
+#                    attention" and the server warns at startup.
+#   Path             root directory. Roots must not be equal or nested. Must
+#                    be the real directory: a root that is itself a symlink
+#                    is refused (symlinks INSIDE a root are followed when
+#                    FollowSymlinks is true). A relative path resolves
+#                    against the server's working directory, not this
+#                    file's directory — use an absolute path.
+#   ExcludePatterns  list of Go regexes; matching files/directories are skipped
+#                                                                    (default: none)
+#                    A pattern starting with "@" is read as a FILE PATH by the
+#                    config loader, not a regex — write the Synology "@eaDir"
+#                    exclude as "^@eaDir$" or "[@]eaDir".
+#   FollowSymlinks   follow symlinked folders while scanning         (default: true)
+#                    Content reached through a link is stored under the link's
+#                    TARGET. If that target lies outside every Path listed here,
+#                    those tracks are listed but do not play (known limitation):
+#                    list the target directory as a scan folder of its own (it
+#                    must not contain another scan folder: roots cannot nest).
+#
+# A directory that is missing at startup (a share that mounts late) is only a
+# warning: the server starts, and scans refuse to run until it is back.
+#
+# With NO scan folder configured at all nothing is scanned and no on-disk media
+# is served: a populated index is still listed, but nothing plays.
+#
+# REMOVING an entry removes its tracks at the next scan — together with their
+# stars, playlist entries and play history. The server warns at startup when
+# indexed tracks belong to a folder that is no longer listed.
+#
+# CHANGING a Path keeps a folder's tracks (ids, stars, playlists, history)
+# only if the old location is gone by the next scan — a move or rename. If
+# the old copy still exists then (e.g. copied to a new disk and repointed),
+# nothing is re-linked: new rows are created and the old ones are swept
+# instead.
+#
+# What users browse — "libraries" — is NOT configured here. A library is a saved
+# filter over the scanned catalog (by scan folder, folder path, file format,
+# release type, compilation or genre), created in Settings → Libraries.
+# Deleting a library never deletes music; removing a scan folder does.
+#
+# ScanFolders:
+#   - Name: "Music"
+#     Path: "/srv/music"
+#   - Name: "Audiobooks"
+#     Path: "/srv/audiobooks"
+#     ExcludePatterns:
+#       - ".*/covers/.*"
+#     FollowSymlinks: false
+#
+# Active dev setup: `make run` scans zarf/locallibrary — drop music there, or
+# run `make sample-library` for ~1 GB of freely licensed albums; git ignores
+# everything in it except its .gitkeep.
+ScanFolders:
+  - Name: "Music"
+    Path: "./zarf/locallibrary"
+
+# Authentication. Three methods:
+#
+#   "none"         — no authentication (dev / trusted LAN only).
+#   "native"       — users stored in the aether database; aether renders its
+#                    own login form and manages sessions.
+#   "proxy-header" — identity comes from headers injected by an authenticating
+#                    reverse proxy (Authelia, Authentik, oauth2-proxy). Aether
+#                    never shows a login form; users are created automatically
+#                    on first sight.
+#
+# --- Method "none": nothing else is needed. ---
+#
+# Auth:
+#   Method: "none"
+#
+# --- Method "native": AdminBootstrap seeds the initial admin, only while the
+# user store is empty (idempotent bootstrap) — changing it later has no effect
+# on an already-seeded store. Pw may be plaintext or a bcrypt hash (generate
+# one with `aether user hash`); a value starting with "@" is loaded from that
+# file's content. ---
+#
+# Auth:
+#   Method: "native"
+#   AdminBootstrap:
+#     User: "admin"
+#     Pw: "admin"                   # or "$2y$..." or "@admin.password"
+#
+# --- Method "proxy-header": AdminBootstrap is ignored; the
+# ProxyHeader block configures which headers carry identity and who is
+# allowed to assert them. Deployment invariants: aether must be unreachable
+# except through the proxy (BindIp: "127.0.0.1"), the proxy must strip
+# inbound identity headers on every request, and /rest must be bypassed at
+# the proxy so Subsonic clients can authenticate with their apiKey. ---
+#
+# Auth:
+#   Method: "proxy-header"
+#   ProxyHeader:
+#     # Header names below are Authelia's defaults; for oauth2-proxy use
+#     # X-Forwarded-User / X-Forwarded-Groups.
+#     UserHeader: "Remote-User"
+#     GroupsHeader: "Remote-Groups"
+#     # Members of this group (per the groups header) get the admin role.
+#     AdminGroup: "aether-admin"
+#     # CIDRs or bare IPs allowed to assert identity headers. Strongly
+#     # recommended; empty trusts every peer that can reach the server
+#     # (a startup warning reminds of this).
+#     TrustedProxies:
+#       - "127.0.0.1"
+#       - "10.0.0.0/8"
+# Active dev setup: proxy-header mode for smoke testing behind the devproxy —
+# run `make proxy USER=admin GROUP=aether-admin` and browse
+# http://localhost:8076 (AdminBootstrap is ignored in this mode; kept for
+# switching back to "native").
+Auth:
+  Method: "native"
+  AdminBootstrap:
+    User: "admin"
+    Pw: "admin"
+#  Method: "proxy-header"
+  ProxyHeader:
+    UserHeader: "Remote-User"
+    GroupsHeader: "Remote-Groups"
+    AdminGroup: "aether-admin"
+    # The devproxy runs on this machine; only local peers may assert identity.
+    # Both loopback forms: a proxy dialing "localhost" arrives as ::1.
+    TrustedProxies:
+      - "127.0.0.1"
+      - "::1"
+
+Env:
+  LogLevel: "info"
+  Production: false
+
+TaskRunner:
+  Parallelism: 2
+  QueueSize: 20
+  HistorySize: 50
+  TagReadWorkers: 0
+  # Directory for per-execution task logs. Empty -> <DataDir>/task-logs.
+  LogDir: ""
+
+# Artist image fetching. Provide at least one provider API key to enable it.
+# A value starting with "@" is loaded from that file's content (path relative to
+# the working directory); these .key files are gitignored. Leave a key file empty
+# to disable that provider — with both empty, the "fetch-artist-images" task
+# reports a "not configured" message when run.
+ArtistImages:
+  FanartApiKey: "@FanartApiKey.api.key"
+  TheAudioDBApiKey: "@TheAudioDBApiKey.api.key"

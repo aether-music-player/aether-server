@@ -1,0 +1,356 @@
+import { describe, it, expect } from 'vitest'
+import { mount } from '@vue/test-utils'
+import PrimeVue from 'primevue/config'
+import TrackList from '@/views/settings/metadata-editor/TrackList.vue'
+import type { Track } from '@/types/metadata'
+
+// Stub the PrimeVue DataTable so we can drive its row-click / update:selection
+// events (TrackList owns the selection logic) without rendering the real table.
+const DataTableStub = {
+    name: 'DataTable',
+    props: ['value', 'selection', 'dataKey', 'rowClass', 'scrollable', 'scrollHeight', 'virtualScrollerOptions'],
+    emits: ['row-click', 'update:selection'],
+    template: '<div><slot /></div>'
+}
+const stubs = {
+    DataTable: DataTableStub,
+    Column: { template: '<div><slot /></div>' },
+    Button: { template: '<button />' }
+}
+
+const mkTrack = (over: Partial<Track> = {}): Track => ({
+    path: 'a.mp3', name: 'a.mp3', title: '', artists: [], album_artists: [],
+    album: '', genres: [], release_types: [], year: 0, track_number: 0, disc_number: 0, disc_subtitle: '', grouping: '', compilation: false,
+    mb_artist_ids: [], mb_album_artist_ids: [], mb_recording_id: '',
+    mb_release_id: '', mb_release_group_id: '',
+    ...over
+})
+
+const tracks = Array.from({ length: 6 }, (_, i) => mkTrack({ path: `p${i}.mp3`, name: `p${i}` }))
+
+function mountList(list: Track[] = tracks) {
+    return mount(TrackList, {
+        props: { tracks: list, isLoading: false, selection: [] },
+        global: { stubs }
+    })
+}
+
+// Reflect the last committed selection back onto the prop, like the parent view.
+async function sync(wrapper: any) {
+    const events = wrapper.emitted('update:selection')
+    if (events?.length) await wrapper.setProps({ selection: events[events.length - 1][0] })
+}
+
+async function click(wrapper: any, index: number, mods: Partial<MouseEvent> = {}) {
+    wrapper.findComponent(DataTableStub).vm.$emit('row-click', {
+        originalEvent: { ctrlKey: false, metaKey: false, shiftKey: false, ...mods },
+        data: wrapper.props('tracks')[index],
+        index
+    })
+    await sync(wrapper)
+}
+
+// A checkbox toggle: PrimeVue swallows the click (it lands inside .p-checkbox) and
+// only re-emits update:selection with the additively toggled list, so the wrapper
+// mousedown is the component's only view of the modifier keys.
+async function checkboxToggle(wrapper: any, index: number, mods: Partial<MouseEvent> = {}) {
+    await wrapper.find('.table-wrapper').trigger('mousedown', { shiftKey: false, ...mods })
+    const track = wrapper.props('tracks')[index]
+    const current: Track[] = wrapper.props('selection')
+    const next = current.some((t) => t.path === track.path)
+        ? current.filter((t) => t.path !== track.path)
+        : [...current, track]
+    wrapper.findComponent(DataTableStub).vm.$emit('update:selection', next)
+    await sync(wrapper)
+}
+
+const paths = (wrapper: any): string[] => {
+    const events = wrapper.emitted('update:selection')
+    return (events[events.length - 1][0] as Track[]).map((t) => t.path)
+}
+
+describe('TrackList selection', () => {
+    it('plain click selects only the clicked row', async () => {
+        const w = mountList()
+        await click(w, 2)
+        expect(paths(w)).toEqual(['p2.mp3'])
+        await click(w, 4)
+        expect(paths(w)).toEqual(['p4.mp3'])
+    })
+
+    it('plain re-click on the sole selected row clears it', async () => {
+        const w = mountList()
+        await click(w, 2)
+        expect(paths(w)).toEqual(['p2.mp3'])
+        await click(w, 2) // click the same row again
+        expect(paths(w)).toEqual([])
+    })
+
+    it('plain click on a selected row within a multi-selection collapses to it', async () => {
+        const w = mountList()
+        await click(w, 2, { ctrlKey: true })
+        await click(w, 4, { ctrlKey: true })
+        expect(paths(w)).toEqual(['p2.mp3', 'p4.mp3'])
+        await click(w, 2) // plain click a selected row while several are selected
+        expect(paths(w)).toEqual(['p2.mp3']) // collapses, does not toggle off
+    })
+
+    it('Ctrl click toggles rows additively', async () => {
+        const w = mountList()
+        await click(w, 2, { ctrlKey: true })
+        await click(w, 4, { ctrlKey: true })
+        expect(paths(w)).toEqual(['p2.mp3', 'p4.mp3'])
+        await click(w, 2, { ctrlKey: true })
+        expect(paths(w)).toEqual(['p4.mp3'])
+    })
+
+    it('Shift click extends the range without dropping earlier selections', async () => {
+        const w = mountList()
+        await click(w, 1) // select the 2nd row
+        await click(w, 3, { ctrlKey: true }) // add the 4th row (anchor)
+        await click(w, 5, { shiftKey: true }) // shift to the 6th row
+        // The earlier plain-selected row survives, plus the anchor→target range.
+        expect(paths(w)).toEqual(['p1.mp3', 'p3.mp3', 'p4.mp3', 'p5.mp3'])
+
+        // Re-dragging the range off the same pivot shrinks it back to the base.
+        await click(w, 4, { shiftKey: true })
+        expect(paths(w)).toEqual(['p1.mp3', 'p3.mp3', 'p4.mp3'])
+    })
+
+    it('Shift checkbox toggle extends the range, like a Shift row click', async () => {
+        const w = mountList()
+        await checkboxToggle(w, 1) // check the 2nd row (anchor)
+        await checkboxToggle(w, 4, { shiftKey: true }) // shift-check the 5th row
+        expect(paths(w)).toEqual(['p1.mp3', 'p2.mp3', 'p3.mp3', 'p4.mp3'])
+
+        // Same pivot, so re-dragging shrinks the range instead of accumulating.
+        await checkboxToggle(w, 2, { shiftKey: true })
+        expect(paths(w)).toEqual(['p1.mp3', 'p2.mp3'])
+    })
+
+    it('Shift checkbox toggle unions onto the earlier committed selection', async () => {
+        const w = mountList()
+        await click(w, 0) // plain-select the 1st row
+        await checkboxToggle(w, 2) // check the 3rd row (new anchor + base)
+        await checkboxToggle(w, 4, { shiftKey: true })
+        expect(paths(w)).toEqual(['p0.mp3', 'p2.mp3', 'p3.mp3', 'p4.mp3'])
+    })
+
+    it('Shift row click extends from a checkbox-set anchor', async () => {
+        const w = mountList()
+        await checkboxToggle(w, 1)
+        await click(w, 3, { shiftKey: true })
+        expect(paths(w)).toEqual(['p1.mp3', 'p2.mp3', 'p3.mp3'])
+    })
+
+    it('a bare checkbox toggle stays additive', async () => {
+        const w = mountList()
+        await checkboxToggle(w, 1)
+        await checkboxToggle(w, 4)
+        expect(paths(w)).toEqual(['p1.mp3', 'p4.mp3'])
+        await checkboxToggle(w, 1)
+        expect(paths(w)).toEqual(['p4.mp3'])
+    })
+
+    it('Shift select-all is not treated as a range', async () => {
+        const w = mountList()
+        await checkboxToggle(w, 1)
+        await w.find('.table-wrapper').trigger('mousedown', { shiftKey: true })
+        w.findComponent(DataTableStub).vm.$emit('update:selection', tracks)
+        await sync(w)
+        expect(paths(w)).toEqual(tracks.map((t) => t.path))
+    })
+
+    it('filters error rows out of a checkbox-driven selection', async () => {
+        const good = mkTrack({ path: 'good.mp3' })
+        const bad = mkTrack({ path: 'bad.mp3', error: 'read error' })
+        const w = mountList([good, bad])
+        w.findComponent(DataTableStub).vm.$emit('update:selection', [good, bad])
+        await w.vm.$nextTick()
+        expect(w.emitted('update:selection')?.[0]?.[0]).toEqual([good])
+    })
+
+    it('Escape clears the selection', async () => {
+        const w = mountList()
+        await click(w, 1, { ctrlKey: true })
+        await click(w, 3, { ctrlKey: true })
+        expect(paths(w)).toEqual(['p1.mp3', 'p3.mp3'])
+        await w.find('.table-wrapper').trigger('keydown', { key: 'Escape' })
+        await sync(w)
+        expect(paths(w)).toEqual([])
+    })
+
+    it('Escape with an empty selection emits nothing', async () => {
+        const w = mountList()
+        await w.find('.table-wrapper').trigger('keydown', { key: 'Escape' })
+        expect(w.emitted('update:selection')).toBeUndefined()
+    })
+})
+
+describe('TrackList arrow-key navigation', () => {
+    async function pressKey(wrapper: any, key: string) {
+        await wrapper.find('.table-wrapper').trigger('keydown', { key })
+        await sync(wrapper)
+    }
+
+    function mountWithSelection(list: Track[], selection: Track[]) {
+        return mount(TrackList, {
+            props: { tracks: list, isLoading: false, selection },
+            global: { stubs }
+        })
+    }
+
+    it('moves a single selection down and up', async () => {
+        const w = mountWithSelection(tracks, [tracks[2]])
+        await pressKey(w, 'ArrowDown')
+        expect(paths(w)).toEqual(['p3.mp3'])
+        await w.setProps({ selection: [tracks[3]] })
+        await pressKey(w, 'ArrowUp')
+        expect(paths(w)).toEqual(['p2.mp3'])
+    })
+
+    it('skips error rows when moving', async () => {
+        const list = [
+            mkTrack({ path: 'a.mp3' }),
+            mkTrack({ path: 'bad.mp3', error: 'read error' }),
+            mkTrack({ path: 'c.mp3' })
+        ]
+        const w = mountWithSelection(list, [list[0]])
+        await pressKey(w, 'ArrowDown')
+        expect(paths(w)).toEqual(['c.mp3'])
+    })
+
+    it('stays put at the list edges', async () => {
+        const w = mountWithSelection(tracks, [tracks[0]])
+        await w.find('.table-wrapper').trigger('keydown', { key: 'ArrowUp' })
+        expect(w.emitted('update:selection')).toBeUndefined()
+    })
+
+    it('does nothing with a multi-selection', async () => {
+        const w = mountWithSelection(tracks, [tracks[0], tracks[1]])
+        await w.find('.table-wrapper').trigger('keydown', { key: 'ArrowDown' })
+        expect(w.emitted('update:selection')).toBeUndefined()
+    })
+})
+
+describe('TrackList virtualization', () => {
+    // The list is windowed only for large flat folders; small albums render every
+    // row so they pay no virtual-scroll cost (and the real-DataTable specs below
+    // keep finding every <tr>).
+    it('passes virtualScrollerOptions for a folder above the threshold', () => {
+        const many = Array.from({ length: 101 }, (_, i) => mkTrack({ path: `p${i}.mp3` }))
+        const w = mount(TrackList, {
+            props: { tracks: many, isLoading: false, selection: [] },
+            global: { stubs }
+        })
+        const opts = w.findComponent(DataTableStub).props('virtualScrollerOptions') as
+            | { itemSize?: number }
+            | undefined
+        expect(opts).toBeTruthy()
+        expect(opts?.itemSize).toBeGreaterThan(0)
+    })
+
+    it('does not virtualize a small folder', () => {
+        const w = mountList() // 6 tracks, below the threshold
+        expect(w.findComponent(DataTableStub).props('virtualScrollerOptions')).toBeUndefined()
+    })
+})
+
+describe('TrackList staged marker', () => {
+    // Mount the real PrimeVue DataTable so the marker column's body slot
+    // renders per row.
+    function mountReal(list: Track[], stagedPaths: ReadonlySet<string>) {
+        return mount(TrackList, {
+            props: { tracks: list, isLoading: false, selection: [], stagedPaths },
+            global: {
+                plugins: [PrimeVue],
+                directives: { tooltip: {} }
+            }
+        })
+    }
+
+    it('marks only rows whose path is staged', () => {
+        const w = mountReal(
+            [mkTrack({ path: 'dirty.mp3' }), mkTrack({ path: 'clean.mp3' })],
+            new Set(['dirty.mp3'])
+        )
+        const markers = w.findAll('[data-test="staged-marker"]')
+        expect(markers).toHaveLength(1)
+        const rows = w.findAll('tbody tr')
+        expect(rows[0].find('[data-test="staged-marker"]').exists()).toBe(true)
+        expect(rows[1].find('[data-test="staged-marker"]').exists()).toBe(false)
+    })
+
+    it('renders no marker without staged paths', () => {
+        const w = mountReal([mkTrack({ path: 'clean.mp3' })], new Set<string>())
+        expect(w.find('[data-test="staged-marker"]').exists()).toBe(false)
+    })
+})
+
+describe('TrackList path display', () => {
+    // Mount the real DataTable so the Path column's body slot renders per row.
+    function mountReal(list: Track[], folderPath: string | null) {
+        return mount(TrackList, {
+            props: { tracks: list, isLoading: false, selection: [], folderPath },
+            global: { plugins: [PrimeVue], directives: { tooltip: {} } }
+        })
+    }
+
+    it('shows each track path relative to the selected folder', () => {
+        const w = mountReal(
+            [
+                mkTrack({ path: 'Artist/Album/01 - Song.mp3' }),
+                mkTrack({ path: 'Artist/Album/CD2/02 - Song.mp3' })
+            ],
+            'Artist/Album'
+        )
+        const rows = w.findAll('tbody tr')
+        expect(rows[0].text()).toContain('01 - Song.mp3')
+        expect(rows[0].text()).not.toContain('Artist/Album')
+        // A subfolder below the selected folder stays qualified so multi-disc
+        // tracks don't collide on a bare file name.
+        expect(rows[1].text()).toContain('CD2/02 - Song.mp3')
+    })
+
+    it("shows the full folder-relative path at the scan folder's root", () => {
+        const w = mountReal([mkTrack({ path: 'Artist/Album/01.mp3' })], null)
+        expect(w.findAll('tbody tr')[0].text()).toContain('Artist/Album/01.mp3')
+    })
+})
+
+describe('TrackList read errors', () => {
+    // Stands in for PrimeVue's v-tooltip and mirrors the bound text onto the
+    // element, so the test can read what a hover would show.
+    const tooltipRecorder = {
+        mounted(el: HTMLElement, binding: { value: unknown }) {
+            el.setAttribute('data-tooltip', String(binding.value ?? ''))
+        },
+        updated(el: HTMLElement, binding: { value: unknown }) {
+            el.setAttribute('data-tooltip', String(binding.value ?? ''))
+        }
+    }
+
+    function mountReal(list: Track[]) {
+        return mount(TrackList, {
+            props: { tracks: list, isLoading: false, selection: [] },
+            global: { plugins: [PrimeVue], directives: { tooltip: tooltipRecorder } }
+        })
+    }
+
+    // The error used to sit in a fixed-width column of its own that stayed blank
+    // for every readable file, cutting the path short for nothing.
+    it('flags an unreadable file in its path cell, with the error on hover', () => {
+        const w = mountReal([
+            mkTrack({ path: 'good.mp3' }),
+            mkTrack({ path: 'bad.mp3', error: 'unsupported tag version' })
+        ])
+        const rows = w.findAll('tbody tr')
+        expect(rows[0].find('[data-test="read-error"]').exists()).toBe(false)
+
+        const icon = rows[1].find('[data-test="read-error"]')
+        expect(icon.exists()).toBe(true)
+        expect(icon.element.closest('td')?.textContent).toContain('bad.mp3')
+        expect(icon.attributes('data-tooltip')).toContain('unsupported tag version')
+        expect(icon.attributes('aria-label')).toContain('unsupported tag version')
+    })
+})

@@ -1,0 +1,123 @@
+// Package pathguard answers one question: is this absolute path inside one of a
+// set of allowed root directories?
+//
+// It exists because the media handlers serve files whose paths come from the
+// database rather than from the request — a track's file_path, an album's
+// cover_path. Nothing enforces that those rows point inside a configured
+// scan folder, so a stale row, a hand-edited one, or a metadata-editor bug can name
+// any file the server process can read. This turns that assumption into an
+// enforced check.
+//
+// metadataedit.ResolveInRoot solves the adjacent problem — joining a
+// request-supplied *relative* path onto a root without escaping it. This one
+// takes an already-absolute path of unknown provenance and asks where it lives.
+package pathguard
+
+import (
+	"path/filepath"
+	"strings"
+)
+
+// Guard holds a set of allowed root directories.
+type Guard struct {
+	roots []string
+}
+
+// New returns a Guard allowing paths inside any of roots. Empty roots are
+// ignored; a Guard with no usable roots allows nothing, because failing open
+// would disable the check exactly when the configuration is broken.
+//
+// Roots are kept as given and resolved on every Allows call, not here: a root
+// may sit behind a symlink whose target appears later (a share that mounts
+// after the server started), and resolving it once would freeze the "not there
+// yet" spelling until a restart. Allows keeps that affordable and keeps one dead
+// mount from stalling the others: see there.
+func New(roots ...string) *Guard {
+	g := &Guard{roots: make([]string, 0, len(roots))}
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		g.roots = append(g.roots, filepath.Clean(r))
+	}
+	return g
+}
+
+// Allows reports whether path lies inside one of the Guard's roots.
+//
+// Roots are resolved here, per call, so a root behind a late mount works (see
+// New). But resolving is a filesystem probe, and a probe on a hung mount blocks
+// until the mount answers. So the root the path is SPELLED under is resolved
+// first, and the check stops there when it matches: a file in a healthy folder
+// is served without ever touching another folder's (possibly dead) root. The
+// other roots are only probed for a path spelled under none of them, or one that
+// resolves out of the root it is spelled under — a row recorded under its
+// resolved spelling, or one the guard is about to refuse. The answer is the same
+// either way; only the order of the probes changes.
+func (g *Guard) Allows(path string) bool {
+	if !filepath.IsAbs(path) || len(g.roots) == 0 {
+		return false // and with no roots, without touching the filesystem at all
+	}
+	clean := filepath.Clean(path)
+	resolved := resolve(clean)
+	var rest []string
+	for _, root := range g.roots {
+		if !contains(root, clean) {
+			rest = append(rest, root)
+			continue
+		}
+		if contains(resolveRoot(root), resolved) {
+			return true
+		}
+	}
+	for _, root := range rest {
+		if contains(resolveRoot(root), resolved) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRoot resolves one root. A variable so a test can see which roots a
+// check touched.
+var resolveRoot = resolve
+
+// Within reports whether path lies inside root. Both are resolved through
+// symlinks first, so a link pointing out of the root does not smuggle a file
+// past the check while a link that stays inside keeps working.
+func Within(root, path string) bool {
+	if root == "" || !filepath.IsAbs(path) || !filepath.IsAbs(root) {
+		return false
+	}
+	return contains(resolve(root), resolve(path))
+}
+
+// resolve cleans path and follows symlinks as far as they exist. A path that
+// does not exist yet cannot be resolved, so the deepest existing ancestor is
+// resolved and the remaining (purely lexical, already cleaned) suffix is
+// rejoined — enough to keep a `..` from escaping while still working for files
+// that were deleted between the scan and the request.
+func resolve(path string) string {
+	clean := filepath.Clean(path)
+	if r, err := filepath.EvalSymlinks(clean); err == nil {
+		return r
+	}
+	dir, base := filepath.Split(clean)
+	parent := filepath.Clean(dir)
+	if parent == clean {
+		// Reached the filesystem root without resolving anything.
+		return clean
+	}
+	return filepath.Join(resolve(parent), base)
+}
+
+// contains reports whether path is root or lives beneath it. Both arguments must
+// already be cleaned and absolute. The separator check is what makes this a path
+// comparison rather than a string-prefix one: /music must not contain
+// /music-private.
+func contains(root, path string) bool {
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
+}

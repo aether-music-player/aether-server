@@ -1,0 +1,814 @@
+package router
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/andresbott/aether/internal/model"
+	"github.com/andresbott/aether/internal/scanfolder"
+	"github.com/getkin/kin-openapi/openapi3"
+	"gorm.io/gorm"
+)
+
+// This file is the response-contract test: it drives real /api/v0 requests
+// through the same maximal-router/auth harness openapi_coverage_test.go and
+// auth_test.go already establish, and validates each captured response BODY
+// against docs/openapi/aether-v0.yaml's schema for that operation and
+// status. TestOpenAPICoversAllV1Routes (openapi_coverage_test.go) only
+// checks that a (method, path) exists on both sides; spec-lint only checks
+// the document is well-formed. Neither ever decodes a real handler response
+// and checks its shape against the schema — this file is what closes that
+// gap: a field rename, a casing slip, a dropped `required`, or an enum value
+// the spec doesn't know about will fail a test here.
+//
+// Validator choice: github.com/getkin/kin-openapi (openapi3), confirmed by a
+// feasibility spike to load and correctly VALIDATE this spec's OpenAPI
+// 3.1-only constructs — `type: [string, 'null']` (TokenInfo.lastUsedAt/
+// expiresAt, ...), `oneOf: [$ref, {type: 'null'}]` (MeResponse.user) and
+// `allOf` composition (ValidationProblem) — accepting a valid body under
+// each shape and REJECTING an invalid one (wrong type, missing required
+// field, a oneOf value matching neither branch). EnableJSONSchema2020() is
+// passed to VisitJSON per kin-openapi's own guidance for 3.1+ documents.
+
+// specDoc parses and OpenAPI-validates docs/openapi/aether-v0.yaml once for
+// the whole test binary (loading + validating a ~3700 line document on every
+// call would needlessly slow the suite down). Resolved relative to this
+// source file, like loadSpecOperations in openapi_coverage_test.go, so it
+// does not depend on "go test"'s working directory.
+var specDocOnce = sync.OnceValues(func() (*openapi3.T, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, errors.New("could not resolve this test file's own location")
+	}
+	specPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "docs", "openapi", "aether-v0.yaml")
+	doc, err := openapi3.NewLoader().LoadFromFile(specPath)
+	if err != nil {
+		return nil, fmt.Errorf("loading %s: %w", specPath, err)
+	}
+	if err := doc.Validate(context.Background()); err != nil {
+		return nil, fmt.Errorf("%s failed OpenAPI validation: %w", specPath, err)
+	}
+	return doc, nil
+})
+
+func specDoc(t *testing.T) *openapi3.T {
+	t.Helper()
+	doc, err := specDocOnce()
+	if err != nil {
+		t.Fatalf("openapi spec: %v", err)
+	}
+	return doc
+}
+
+// operationByID finds the operation with the given operationId anywhere in
+// the spec. docs/openapi/aether-v0.yaml's paths are mount-relative
+// (api-conventions.md, "Mount-relative paths") while every request in this
+// file goes through the real /api/v0 mount, so looking operations up by
+// their stable operationId — rather than reconstructing a mount-relative
+// path by hand at each call site — is both less error-prone and self-
+// documenting about which spec operation a given request is expected to
+// satisfy.
+func operationByID(t *testing.T, doc *openapi3.T, id string) *openapi3.Operation {
+	t.Helper()
+	for _, item := range doc.Paths.Map() {
+		for _, op := range item.Operations() {
+			if op.OperationID == id {
+				return op
+			}
+		}
+	}
+	t.Fatalf("no operation with operationId %q in docs/openapi/aether-v0.yaml", id)
+	return nil
+}
+
+// contentTypeBase strips any parameters (e.g. "; charset=utf-8") off a
+// Content-Type header value, so it can be matched against the bare media
+// type keys the spec's `content:` maps use.
+func contentTypeBase(ct string) string {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.TrimSpace(ct)
+}
+
+// responseSchema resolves the schema docs/openapi/aether-v0.yaml documents
+// for operationID's response at status, under contentType. Missing
+// operation/status/media-type is a Fatalf, not a skip: this file exists to
+// prove response bodies match the spec, so an assertion that silently
+// checked nothing would defeat the point.
+func responseSchema(t *testing.T, doc *openapi3.T, operationID string, status int, contentType string) *openapi3.Schema {
+	t.Helper()
+	op := operationByID(t, doc, operationID)
+	respRef := op.Responses.Status(status)
+	if respRef == nil || respRef.Value == nil {
+		t.Fatalf("%s: spec has no documented response for status %d", operationID, status)
+	}
+	media := respRef.Value.Content.Get(contentType)
+	if media == nil || media.Schema == nil || media.Schema.Value == nil {
+		t.Fatalf("%s %d: spec documents no %q schema (response Content-Type)", operationID, status, contentType)
+	}
+	return media.Schema.Value
+}
+
+// assertJSONResponse validates w's JSON body against the schema
+// docs/openapi/aether-v0.yaml declares for operationID's response at status.
+// It also pins the Content-Type actually sent to a JSON media type, since a
+// schema match against the wrong media type (e.g. a plain-json body that
+// should have been problem+json) would prove nothing.
+func assertJSONResponse(t *testing.T, doc *openapi3.T, operationID string, status int, w *httptest.ResponseRecorder) {
+	t.Helper()
+	ct := contentTypeBase(w.Header().Get("Content-Type"))
+	if ct != "application/json" && ct != "application/problem+json" {
+		t.Fatalf("%s %d: Content-Type = %q, want application/json or application/problem+json",
+			operationID, status, w.Header().Get("Content-Type"))
+	}
+	schema := responseSchema(t, doc, operationID, status, ct)
+
+	var data any
+	if err := json.Unmarshal(w.Body.Bytes(), &data); err != nil {
+		t.Fatalf("%s %d: response body is not JSON: %v\nbody: %s", operationID, status, err, w.Body.String())
+	}
+	if err := schema.VisitJSON(data, openapi3.EnableJSONSchema2020()); err != nil {
+		t.Errorf("%s %d: response body does not match its documented schema:\n%v\nbody: %s",
+			operationID, status, err, w.Body.String())
+	}
+}
+
+// mustJSON marshals v for use as a request body; failures are a test setup
+// bug (a value that cannot marshal), not something under test.
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	return b
+}
+
+// newContractTaskRouter builds a native-auth MainAppHandler with the task
+// runner and schedule store both wired, via withTaskRunner (auth_test.go) —
+// the one piece newNativeAuthRouter otherwise leaves unset, and attachApiV0
+// (api_v0.go) gates the entire /tasks group on a non-nil task runner —
+// logged in as the sole admin user so every call site here can attach the
+// session immediately. Runner tasks are never actually started (no
+// Runner.Start()/RegisterTask call): AddRun only enqueues by name
+// (internal/taskrunner, github.com/go-bumbu/tempo's TaskQueue.Add), so
+// triggerTask's immediate HTTP response — the only thing this file asserts
+// about it — needs no registered task function.
+func newContractTaskRouter(t *testing.T) (*MainAppHandler, func(*http.Request)) {
+	t.Helper()
+	h, _ := newNativeAuthRouter(t, withTaskRunner)
+	_, attach := doLogin(t, h, "alice", "secret")
+	return h, attach
+}
+
+// --- Bootstrap: health, version, me (anonymous and authenticated) ---
+
+func TestContractBootstrapResponses(t *testing.T) {
+	doc := specDoc(t)
+	h, _ := newNativeAuthRouter(t)
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v0/health", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /health = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getHealth", http.StatusOK, w)
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v0/version", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /version = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getVersion", http.StatusOK, w)
+
+	// Anonymous: MeResponse.user must validate as null (the oneOf's second
+	// branch, `{type: 'null'}` — OpenAPI 3.1 syntax).
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v0/me", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /me (anonymous) = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getMe", http.StatusOK, w)
+
+	// Authenticated: MeResponse.user must validate as a populated MeUser (the
+	// oneOf's first branch, a $ref).
+	_, attach := doLogin(t, h, "alice", "secret")
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/me", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /me (admin session) = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getMe", http.StatusOK, w)
+}
+
+// --- Error shapes: 401, 403, 404, 400, 422 ---
+
+func TestContractErrorShapes(t *testing.T) {
+	doc := specDoc(t)
+	h, _ := newNativeAuthRouter(t)
+
+	// 401: no session at all on an admin-gated route. sessionGuard
+	// (api_v0.go) answers this before the listUsers handler ever runs, but
+	// the spec documents 401 on the operation itself.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v0/users", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /users without session = %d, want 401: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listUsers", http.StatusUnauthorized, w)
+
+	// 403: authenticated but not admin.
+	_, bobAttach := doLogin(t, h, "bob", "secret")
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/users", nil)
+	bobAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GET /users as non-admin = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listUsers", http.StatusForbidden, w)
+
+	_, adminAttach := doLogin(t, h, "alice", "secret")
+
+	// 404: a library id that does not exist.
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/libraries/999999", nil)
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GET /libraries/999999 = %d, want 404: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getLibrary", http.StatusNotFound, w)
+
+	// 400: malformed JSON body (a request that never gets far enough to be
+	// "well-formed but invalid").
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/libraries", strings.NewReader(`{`))
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("POST /libraries with malformed JSON = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createLibrary", http.StatusBadRequest, w)
+
+	// 422: well-formed but invalid — a name over LibraryWriteRequest's
+	// 200-char maxLength — itemising /name via ValidationProblem.
+	body := mustJSON(t, map[string]any{"name": strings.Repeat("x", 201)})
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/libraries", bytes.NewReader(body))
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /libraries with an over-long name = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createLibrary", http.StatusUnprocessableEntity, w)
+}
+
+// --- Libraries: create-then-list, the Library/LibraryList envelopes ---
+
+// TestContractLibrariesCreateAndList also asserts BY CONTENT, not just
+// schema, that a scan_folder filter naming a configured folder round-trips
+// through createLibrary into listLibraries, and that the same filter naming
+// an unconfigured folder is refused with 422 at the exact libraryfilter
+// pointer. That 201-vs-422 difference is the proof that Folders reaches
+// libraryHandler.Handler through router.New/attachApiV0: with the
+// `Folders: h.scanFolders` line removed from api_v0.go, h.Folders is nil,
+// every scan_folder value fails Validate's folders.ByName lookup, and BOTH
+// requests below would answer 422 instead of 201-then-422.
+func TestContractLibrariesCreateAndList(t *testing.T) {
+	doc := specDoc(t)
+	music := t.TempDir()
+	h, _ := newNativeAuthRouter(t, func(t *testing.T, cfg *Cfg, _ *gorm.DB) {
+		t.Helper()
+		set, err := scanfolder.NewSet([]scanfolder.Folder{{Name: "Music", Path: music}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ScanFolders = set
+	})
+	_, adminAttach := doLogin(t, h, "alice", "secret")
+
+	body := mustJSON(t, map[string]any{
+		"name": "Contract Test Library",
+		"filters": []map[string]any{
+			{"field": "scan_folder", "values": []string{"Music"}},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v0/libraries", bytes.NewReader(body))
+	adminAttach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /libraries = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createLibrary", http.StatusCreated, w)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/libraries", nil)
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /libraries = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listLibraries", http.StatusOK, w)
+
+	// The schema validates a library with no filters (or a nil Folders that
+	// dropped them) just as happily, so checking it alone would keep this
+	// test green even if the filter never reached storage — assert the
+	// round trip by content instead.
+	var list struct {
+		Libraries []struct {
+			Name    string `json:"name"`
+			Filters []struct {
+				Field  string   `json:"field"`
+				Values []string `json:"values"`
+			} `json:"filters"`
+		} `json:"libraries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decoding the list body: %v: %s", err, w.Body.String())
+	}
+	var found bool
+	for _, lib := range list.Libraries {
+		if lib.Name != "Contract Test Library" {
+			continue
+		}
+		found = true
+		if len(lib.Filters) != 1 || lib.Filters[0].Field != "scan_folder" ||
+			len(lib.Filters[0].Values) != 1 || lib.Filters[0].Values[0] != "Music" {
+			t.Fatalf("listLibraries filters = %+v, want [{scan_folder [Music]}]", lib.Filters)
+		}
+	}
+	if !found {
+		t.Fatalf("listLibraries did not report the created library: %s", w.Body.String())
+	}
+
+	// The same filter shape, naming a scan folder that is NOT configured:
+	// 422, itemising the exact pointer libraryfilter.Validate reports.
+	body = mustJSON(t, map[string]any{
+		"name": "Contract Test Library (unconfigured folder)",
+		"filters": []map[string]any{
+			{"field": "scan_folder", "values": []string{"Nope"}},
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/libraries", bytes.NewReader(body))
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /libraries with an unconfigured scan_folder = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createLibrary", http.StatusUnprocessableEntity, w)
+	var problem struct {
+		Errors []struct {
+			Pointer string `json:"pointer"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decoding the 422 body: %v: %s", err, w.Body.String())
+	}
+	if len(problem.Errors) == 0 || problem.Errors[0].Pointer != "/filters/0/values/0" {
+		t.Fatalf("errors[0].pointer = %+v, want a single entry at /filters/0/values/0", problem.Errors)
+	}
+}
+
+// TestContractLibraryFilterOptionsPreviewAndBrowse asserts BY CONTENT, not
+// just schema, that Folders and Store both reach getLibraryFilterOptions,
+// previewLibrary and browseLibraryPath through router.New/attachApiV0:
+// filter-options lists the configured "Music" folder, browse with no path
+// lists its root at the configured directory, and preview's 200-vs-422 split
+// on a configured vs. unconfigured scan_folder name (with a real track_count
+// for the configured one) is the same proof TestContractLibrariesCreateAndList
+// uses for createLibrary — a schema-only assertion would pass just as
+// happily with h.Folders or h.Store never reaching these handlers.
+func TestContractLibraryFilterOptionsPreviewAndBrowse(t *testing.T) {
+	doc := specDoc(t)
+	music := t.TempDir()
+	h, db := newNativeAuthRouter(t, func(t *testing.T, cfg *Cfg, _ *gorm.DB) {
+		t.Helper()
+		set, err := scanfolder.NewSet([]scanfolder.Folder{{Name: "Music", Path: music}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ScanFolders = set
+	})
+	_, adminAttach := doLogin(t, h, "alice", "secret")
+
+	album := model.Album{Name: "A", NameNorm: "a", AlbumArtistNorm: "x"}
+	if err := db.Create(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	track := model.Track{AlbumID: album.ID, ScanFolder: "Music", Suffix: "flac", Filename: "1.flac", FilePath: filepath.Join(music, "1.flac")}
+	if err := db.Create(&track).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// getLibraryFilterOptions: scan_folders must name the configured folder.
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/libraries/filter-options", nil)
+	adminAttach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /libraries/filter-options = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getLibraryFilterOptions", http.StatusOK, w)
+	var options struct {
+		ScanFolders []string `json:"scan_folders"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &options); err != nil {
+		t.Fatalf("decoding filter-options: %v: %s", err, w.Body.String())
+	}
+	if len(options.ScanFolders) != 1 || options.ScanFolders[0] != "Music" {
+		t.Fatalf("scan_folders = %v, want [Music]", options.ScanFolders)
+	}
+
+	// browseLibraryPath with no path: lists the configured root, not the
+	// filesystem root, and without erroring even though nothing else about
+	// the path was given.
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/libraries/browse", nil)
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /libraries/browse = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "browseLibraryPath", http.StatusOK, w)
+	var browsed struct {
+		Path    string `json:"path"`
+		Folders []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"folders"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &browsed); err != nil {
+		t.Fatalf("decoding browse: %v: %s", err, w.Body.String())
+	}
+	if len(browsed.Folders) != 1 || browsed.Folders[0].Name != "Music" || browsed.Folders[0].Path != music {
+		t.Fatalf("browse folders = %+v, want a single Music root at %q", browsed.Folders, music)
+	}
+
+	// previewLibrary, a configured scan_folder: 200, and the counts reflect
+	// the one seeded track (proving Store, not just Folders, reaches preview).
+	body := mustJSON(t, map[string]any{"filters": []map[string]any{{"field": "scan_folder", "values": []string{"Music"}}}})
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/libraries/preview", bytes.NewReader(body))
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /libraries/preview (Music) = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "previewLibrary", http.StatusOK, w)
+	var preview struct {
+		TrackCount int64 `json:"track_count"`
+		AlbumCount int64 `json:"album_count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &preview); err != nil {
+		t.Fatalf("decoding preview: %v: %s", err, w.Body.String())
+	}
+	if preview.TrackCount != 1 || preview.AlbumCount != 1 {
+		t.Fatalf("preview = %+v, want track_count=1 album_count=1", preview)
+	}
+
+	// previewLibrary, an unconfigured scan_folder name: 422.
+	body = mustJSON(t, map[string]any{"filters": []map[string]any{{"field": "scan_folder", "values": []string{"Nope"}}}})
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/libraries/preview", bytes.NewReader(body))
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /libraries/preview (Nope) = %d, want 422: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "previewLibrary", http.StatusUnprocessableEntity, w)
+}
+
+// --- Scan folders: the read-only list of what the config declares ---
+
+func TestContractScanFoldersList(t *testing.T) {
+	doc := specDoc(t)
+	music := t.TempDir()
+	// A second, separate temp dir: roots must not nest, so the missing root
+	// cannot live under the first one.
+	offline := filepath.Join(t.TempDir(), "not-mounted")
+	h, _ := newNativeAuthRouter(t, func(t *testing.T, cfg *Cfg, _ *gorm.DB) {
+		t.Helper()
+		set, err := scanfolder.NewSet([]scanfolder.Folder{
+			{Name: "Music", Path: music, ExcludePatterns: []string{`^\.`}, FollowSymlinks: true},
+			// Not there: exercises available:false with a problem.
+			{Name: "Offline", Path: offline},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ScanFolders = set
+	})
+	_, adminAttach := doLogin(t, h, "alice", "secret")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/scan-folders", nil)
+	adminAttach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /scan-folders = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listScanFolders", http.StatusOK, w)
+
+	// The schema validates an EMPTY list just as happily, so checking it alone
+	// would keep this test green with the configured set never reaching the
+	// handler. Assert the two entries by content instead.
+	var body struct {
+		ScanFolders []struct {
+			Name      string `json:"name"`
+			Available bool   `json:"available"`
+			Problem   string `json:"problem"`
+		} `json:"scan_folders"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding the body: %v: %s", err, w.Body.String())
+	}
+	if len(body.ScanFolders) != 2 {
+		t.Fatalf("got %d scan folders, want the 2 configured ones: %s", len(body.ScanFolders), w.Body.String())
+	}
+	if got := body.ScanFolders[0].Name; got != "Music" {
+		t.Errorf("scan_folders[0].name = %q, want \"Music\" (the set is in name order)", got)
+	}
+	if !body.ScanFolders[0].Available {
+		t.Errorf("scan_folders[0].available = false, want true: %q exists", music)
+	}
+	if got := body.ScanFolders[1].Name; got != "Offline" {
+		t.Errorf("scan_folders[1].name = %q, want \"Offline\" (the set is in name order)", got)
+	}
+	if body.ScanFolders[1].Available {
+		t.Errorf("scan_folders[1].available = true, want false: %q is not there", offline)
+	}
+	if body.ScanFolders[1].Problem == "" {
+		t.Error("scan_folders[1].problem is empty; an unavailable root must say why")
+	}
+
+	// Admin-only, like every management route: a regular user is refused.
+	_, bobAttach := doLogin(t, h, "bob", "secret")
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/scan-folders", nil)
+	bobAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("GET /scan-folders as non-admin = %d, want 403: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listScanFolders", http.StatusForbidden, w)
+}
+
+// --- Users: create-then-list, the User/UserList envelopes ---
+
+func TestContractUsersCreateAndList(t *testing.T) {
+	doc := specDoc(t)
+	h, _ := newNativeAuthRouter(t)
+	_, adminAttach := doLogin(t, h, "alice", "secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v0/users", strings.NewReader(`{"login":"contractuser","password":"s3cret-password"}`))
+	adminAttach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /users = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createUser", http.StatusCreated, w)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/users", nil)
+	adminAttach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /users = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listUsers", http.StatusOK, w)
+}
+
+// --- Tokens: the trickiest conditional shapes (apikey vs usertoken,
+// nullable lastUsedAt/expiresAt, camelCase) ---
+
+func TestContractTokensCreateAndList(t *testing.T) {
+	doc := specDoc(t)
+	h, _ := newNativeAuthRouter(t)
+	_, attach := doLogin(t, h, "bob", "secret")
+
+	// createToken, default type "apikey": CreateTokenResult without
+	// username/password (present only for "usertoken").
+	req := httptest.NewRequest(http.MethodPost, "/api/v0/auth/tokens", strings.NewReader(`{"name":"contract-apikey"}`))
+	attach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /auth/tokens (apikey) = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createToken", http.StatusCreated, w)
+
+	// createToken, type "usertoken": the conditional username/password
+	// branch, plus expiresAt:null (omitted in the request).
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/auth/tokens", strings.NewReader(`{"name":"contract-usertoken","type":"usertoken"}`))
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /auth/tokens (usertoken) = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createToken", http.StatusCreated, w)
+
+	// mintToken: the camelCase SPA session/device shape.
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/auth/token", strings.NewReader(`{"deviceId":"contract-device"}`))
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /auth/token = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "mintToken", http.StatusCreated, w)
+
+	// listTokens: both the two just-created client PATs and the live mint
+	// session, exercising TokenInfo's nullable lastUsedAt (never used yet)
+	// and expiresAt (the apikey token never expires) side by side with the
+	// mint session's populated ones.
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/auth/tokens", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /auth/tokens = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listTokens", http.StatusOK, w)
+}
+
+// TestCreateTokenResultRejectsCredentialTypeMismatch proves the
+// CreateTokenResult oneOf split (aether-v0.yaml) is an enforced "iff", not
+// merely documented prose: a synthetic "apikey" body wrongly carrying
+// username/password is REJECTED (the gap #5 closed — the apikey oneOf
+// variant now forbids them via not/anyOf over required, not just omits them
+// from its own properties), a synthetic "usertoken" body missing them is
+// REJECTED, and a clean body of either shape PASSES. Validates directly
+// against the schema with the exact same call assertJSONResponse makes
+// (schema.VisitJSON + EnableJSONSchema2020()), so this exercises the actual
+// validator/dialect real responses are checked against — kin-openapi's
+// EnableJSONSchema2020 path compiles the schema with
+// github.com/santhosh-tekuri/jsonschema/v6 (a JSON Schema 2020-12 engine
+// that does evaluate if/then/else and every XOF keyword), not the legacy
+// pre-3.1 visitJSON/visitXOFOperations code path, which is only a fallback
+// used when that compilation itself fails.
+func TestCreateTokenResultRejectsCredentialTypeMismatch(t *testing.T) {
+	doc := specDoc(t)
+	schema := responseSchema(t, doc, "createToken", http.StatusCreated, "application/json")
+
+	valid := func(name string, body map[string]any) {
+		t.Run(name, func(t *testing.T) {
+			if err := schema.VisitJSON(body, openapi3.EnableJSONSchema2020()); err != nil {
+				t.Fatalf("expected a valid CreateTokenResult, got: %v\nbody: %+v", err, body)
+			}
+		})
+	}
+	invalid := func(name string, body map[string]any) {
+		t.Run(name, func(t *testing.T) {
+			if err := schema.VisitJSON(body, openapi3.EnableJSONSchema2020()); err == nil {
+				t.Fatalf("expected CreateTokenResult validation to reject this body, but it passed: %+v", body)
+			}
+		})
+	}
+
+	valid("apikey without credentials passes", map[string]any{
+		"token": "aether-abc123", "tokenId": "abc123", "name": "contract-test",
+		"kind": "client", "type": "apikey",
+		"createdAt": "2026-01-01T00:00:00Z", "expiresAt": nil,
+	})
+	invalid("apikey wrongly carrying username/password is rejected", map[string]any{
+		"token": "aether-abc123", "tokenId": "abc123", "name": "contract-test",
+		"kind": "client", "type": "apikey",
+		"createdAt": "2026-01-01T00:00:00Z", "expiresAt": nil,
+		"username": "abc123", "password": "secret",
+	})
+	valid("usertoken with both credentials passes", map[string]any{
+		"token": "aether-abc123", "tokenId": "abc123", "name": "contract-test",
+		"kind": "client", "type": "usertoken",
+		"createdAt": "2026-01-01T00:00:00Z", "expiresAt": nil,
+		"username": "abc123", "password": "secret",
+	})
+	invalid("usertoken missing username/password is rejected", map[string]any{
+		"token": "aether-abc123", "tokenId": "abc123", "name": "contract-test",
+		"kind": "client", "type": "usertoken",
+		"createdAt": "2026-01-01T00:00:00Z", "expiresAt": nil,
+	})
+}
+
+// --- Tasks: the flattened-embed + wrapped-vs-bare Task shapes, an empty
+// envelope before any run, and the populated one after ---
+
+func TestContractTasksListCreateGetTriggerAndExecutions(t *testing.T) {
+	doc := specDoc(t)
+	h, attach := newContractTaskRouter(t)
+
+	// listTasks: the TaskList envelope, entries with no schedules configured
+	// yet (Task.schedules present but empty, per its required, non-nullable
+	// array shape).
+	req := httptest.NewRequest(http.MethodGet, "/api/v0/tasks", nil)
+	attach(req)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /tasks = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listTasks", http.StatusOK, w)
+
+	// listTaskExecutions before any run: the empty-list envelope.
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/tasks/executions", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/executions (before any run) = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listTaskExecutions", http.StatusOK, w)
+
+	// createTaskSchedule: the bare TaskSchedule, now carrying params — the
+	// trickiest shape in this group.
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/tasks/scan/schedules",
+		strings.NewReader(`{"cron_expression":"0 0 0 * * *","params":{"full":true}}`))
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /tasks/scan/schedules = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "createTaskSchedule", http.StatusCreated, w)
+
+	var createdSchedule struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &createdSchedule); err != nil || createdSchedule.ID == "" {
+		t.Fatalf("createTaskSchedule: missing schedule id: %v (%s)", err, w.Body.String())
+	}
+
+	// getTask: bare Task, reading the schedule just created back in its
+	// schedules array.
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/tasks/scan", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/scan = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "getTask", http.StatusOK, w)
+
+	// triggerTask: 202 + TriggerTaskResult's execution_id.
+	req = httptest.NewRequest(http.MethodPost, "/api/v0/tasks/scan/trigger", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("POST /tasks/scan/trigger = %d, want 202: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "triggerTask", http.StatusAccepted, w)
+
+	// patchTaskSchedule: 200 + the updated TaskSchedule (the {name} in the
+	// path is enforced against the schedule's owner — a mismatch 404s).
+	req = httptest.NewRequest(http.MethodPatch, "/api/v0/tasks/scan/schedules/"+createdSchedule.ID,
+		strings.NewReader(`{"enabled":false}`))
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH /tasks/scan/schedules/{id} = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "patchTaskSchedule", http.StatusOK, w)
+
+	// deleteTaskSchedule: 204 with an empty body.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v0/tasks/scan/schedules/"+createdSchedule.ID, nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /tasks/scan/schedules/{id} = %d, want 204: %s", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("deleteTaskSchedule 204 must have an empty body, got: %s", w.Body.String())
+	}
+
+	// listTaskExecutions again: now populated by the triggered run, and
+	// TaskExecution's ended_at is still its Go zero-time value (the run was
+	// never started: no Runner.Start() in newContractTaskRouter).
+	req = httptest.NewRequest(http.MethodGet, "/api/v0/tasks/executions", nil)
+	attach(req)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /tasks/executions (after trigger) = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	assertJSONResponse(t, doc, "listTaskExecutions", http.StatusOK, w)
+}

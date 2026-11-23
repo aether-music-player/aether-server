@@ -1,0 +1,394 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import Toast from 'primevue/toast'
+import { useUiStore } from '@/store/uiStore'
+import { useVersion } from '@/composables/useVersion'
+import { useUserManagement } from '@/composables/useUsers'
+
+interface SettingsNavItem {
+    label: string
+    icon: string
+    route?: string
+    action?: () => void
+}
+interface SettingsNavGroup {
+    label: string
+    items: SettingsNavItem[]
+}
+
+const route = useRoute()
+const router = useRouter()
+const uiStore = useUiStore()
+
+// Settings is administration only now: the account concerns live in the
+// sidebar's UserMenu popup, and the user's own settings are a main content
+// view at /user-settings.
+
+// The Users entry only exists when the server reports the user-management
+// feature (auth method "native"); with method "none" the users API is not
+// even mounted, so the entry is hidden.
+const userManagement = useUserManagement()
+
+const groups = computed<SettingsNavGroup[]>(() => [
+    {
+        label: 'Administration',
+        items: [
+            { label: 'Libraries', icon: 'ms-folder', route: '/settings/libraries' },
+            ...(userManagement.value
+                ? [{ label: 'Users', icon: 'ms-group', route: '/settings/users' }]
+                : []),
+            { label: 'Tasks', icon: 'ms-schedule', route: '/settings/tasks' }
+        ]
+    },
+    {
+        // The metadata editor is a top-level route (/metadata-editor) rendered
+        // in this layout, so it also gets a side-nav entry here, under its own
+        // Tools header (it is reachable from the sidebar UserMenu as well).
+        label: 'Tools',
+        items: [{ label: 'Metadata Editor', icon: 'ms-edit', route: '/metadata-editor' }]
+    }
+])
+
+const collapsed = computed(() => uiStore.settingsSidebarCollapsed)
+
+const isActive = (item: SettingsNavItem): boolean =>
+    item.route ? route.path.startsWith(item.route) : false
+const onNavItem = (item: SettingsNavItem) => {
+    if (item.action) item.action()
+    else if (item.route) router.push(item.route)
+}
+const goBack = () => router.push('/')
+
+const { data: serverVersion } = useVersion()
+
+// Expanded shows "version: v1.2.3"; collapsed has no room for a label, so the
+// version is omitted entirely there. The "v" is only prepended to bare numeric
+// versions — non-release builds ("dev-build") are shown verbatim.
+const versionLabel = computed(() => {
+    const v = serverVersion.value?.version
+    if (!v) return ''
+    return /^\d/.test(v) ? `v${v}` : v
+})
+
+const versionTitle = computed(() => {
+    const info = serverVersion.value
+    if (!info) return ''
+    const parts = [versionLabel.value]
+    if (info.commit && info.commit !== 'undefined') parts.push(info.commit.slice(0, 8))
+    if (info.build_time) parts.push(info.build_time)
+    return parts.join(' · ')
+})
+</script>
+
+<template>
+    <div class="settings-layout">
+        <aside class="settings-sidebar" :class="{ collapsed }">
+            <div class="sidebar-header">
+                <h1 v-if="!collapsed" class="settings-title">Settings</h1>
+                <button
+                    class="collapse-btn"
+                    type="button"
+                    :aria-label="collapsed ? 'Expand settings sidebar' : 'Collapse settings sidebar'"
+                    v-tooltip.right="collapsed ? 'Expand' : undefined"
+                    @click="uiStore.toggleSettingsSidebar"
+                >
+                    <i :class="collapsed ? 'ms-chevron-right' : 'ms-chevron-left'"></i>
+                </button>
+            </div>
+
+            <nav class="sidebar-nav">
+                <template v-for="(group, gi) in groups" :key="group.label">
+                    <div v-if="!collapsed" class="nav-section-label">{{ group.label }}</div>
+                    <div v-else-if="gi > 0" class="nav-separator"></div>
+                    <button
+                        v-for="item in group.items"
+                        :key="item.label"
+                        class="nav-item"
+                        :class="{ active: isActive(item) }"
+                        type="button"
+                        :aria-label="item.label"
+                        @click="onNavItem(item)"
+                        v-tooltip.right="collapsed ? item.label : undefined"
+                    >
+                        <i :class="item.icon"></i>
+                        <span v-if="!collapsed" class="nav-label">{{ item.label }}</span>
+                    </button>
+                </template>
+            </nav>
+
+            <div
+                v-if="!collapsed && versionLabel"
+                class="sidebar-version"
+                :title="versionTitle"
+            >
+                version: {{ versionLabel }}
+            </div>
+
+            <nav class="sidebar-footer-nav">
+                <button
+                    class="nav-item"
+                    type="button"
+                    aria-label="Back to player"
+                    @click="goBack"
+                    v-tooltip.right="collapsed ? 'Back to player' : undefined"
+                >
+                    <i class="ms-arrow-back"></i>
+                    <span v-if="!collapsed" class="nav-label">Back to player</span>
+                </button>
+            </nav>
+        </aside>
+
+        <main class="settings-content">
+            <RouterView />
+        </main>
+
+        <!-- Every settings view reports failures through useToast (library CRUD,
+             task actions). Without a Toast outlet in this layout those messages
+             are raised and silently dropped, since the only other outlet lives
+             in PlayerLayout, which is not mounted under /settings. -->
+        <Toast />
+    </div>
+</template>
+
+<style scoped>
+.settings-layout {
+    display: flex;
+    height: 100dvh;
+    width: 100%;
+    background-color: var(--app-background);
+    overflow: hidden;
+}
+
+.settings-sidebar {
+    width: var(--app-sidebar-width);
+    height: 100%;
+    background-color: var(--app-nav-bg);
+    border-right: 1px solid var(--app-border);
+    display: flex;
+    flex-direction: column;
+    transition: width 0.3s ease;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+
+.settings-sidebar.collapsed {
+    width: var(--app-sidebar-collapsed-width);
+}
+
+.sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.5rem 0.5rem 1.5rem;
+    min-height: 3rem;
+    box-sizing: border-box;
+    flex-shrink: 0;
+}
+
+.settings-sidebar.collapsed .sidebar-header {
+    justify-content: center;
+    padding: 0.5rem;
+}
+
+.settings-title {
+    flex: 1;
+    font-size: 1.25rem;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: var(--app-nav-brand);
+    margin: 0;
+    white-space: nowrap;
+}
+
+.collapse-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border: none;
+    background: transparent;
+    color: var(--app-nav-text-dim);
+    cursor: pointer;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background-color 0.15s, color 0.15s;
+}
+
+.collapse-btn:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: var(--app-nav-text);
+}
+
+.sidebar-nav {
+    display: flex;
+    flex-direction: column;
+    padding: 0 0 0.75rem;
+    gap: 0.25rem;
+    flex: 1;
+    overflow-y: auto;
+}
+
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.55rem 1rem;
+    border: none;
+    border-radius: 0;
+    background: none;
+    cursor: pointer;
+    color: var(--app-nav-text-dim);
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: background-color 0.2s, color 0.2s;
+    white-space: nowrap;
+    text-align: left;
+    width: 100%;
+}
+
+.settings-sidebar.collapsed .nav-item {
+    justify-content: center;
+    padding: 0.55rem;
+}
+
+.nav-item:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: var(--app-nav-text);
+}
+
+.nav-item.active {
+    background-color: var(--app-accent-soft);
+    color: var(--app-accent);
+    box-shadow: inset -4px 0 0 var(--app-accent);
+}
+
+.nav-item.active:hover {
+    background-color: var(--app-accent-soft-hover);
+}
+
+.nav-item i {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+}
+
+.nav-section-label {
+    display: block;
+    padding: 0 1rem;
+    margin: 0.75rem 0 0.25rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--app-nav-text-dim);
+}
+
+.nav-separator {
+    margin: 0.75rem 1rem 0.25rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-footer-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    flex-shrink: 0;
+    padding: 0.75rem 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Deliberately faint: build info should be findable, never eye-catching. */
+.sidebar-version {
+    flex-shrink: 0;
+    padding: 0 1rem 0.5rem;
+    font-size: 0.65rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: var(--app-nav-text-dim);
+    opacity: 0.45;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: opacity 0.2s;
+    cursor: default;
+}
+
+.sidebar-version:hover {
+    opacity: 0.8;
+}
+
+/* The one scroller for every settings view, like PlayerLayout's .main-content:
+   the layout is a single viewport tall, so a view taller than the pane scrolls
+   here. The metadata editor fills the pane (height: 100%) and scrolls its own
+   panels, so it never overflows it. */
+.settings-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+}
+
+/* Phone: the side nav becomes an icon top bar (spec §5 — usable, not
+   redesigned). Collapse is a desktop concept; on a bar there is nothing to
+   collapse, so the button and the width machinery are hidden wholesale.
+   767.98px = $bp-phone-max - 0.02px (guarded by breakpoints.spec.ts). */
+@media (max-width: 767.98px) {
+    .settings-layout {
+        flex-direction: column;
+    }
+
+    .settings-sidebar,
+    .settings-sidebar.collapsed {
+        width: 100%;
+        height: auto;
+        flex-direction: row;
+        align-items: center;
+        border-right: none;
+        border-bottom: 1px solid var(--app-border);
+    }
+
+    .sidebar-header {
+        min-height: 0;
+        padding: 0.5rem 0.25rem 0.5rem 0.75rem;
+    }
+
+    .settings-title {
+        display: none;
+    }
+
+    .collapse-btn {
+        display: none;
+    }
+
+    .sidebar-nav {
+        flex-direction: row;
+        align-items: center;
+        padding: 0;
+        gap: 0;
+        overflow-y: visible;
+        overflow-x: auto;
+    }
+
+    .nav-label,
+    .nav-section-label,
+    .sidebar-version {
+        display: none;
+    }
+
+    .nav-item {
+        width: auto;
+        padding: 0.65rem 0.85rem;
+    }
+
+    .nav-item.active {
+        box-shadow: inset 0 -3px 0 var(--app-accent);
+    }
+
+    .sidebar-footer-nav {
+        border-top: none;
+        padding: 0;
+        margin-left: auto;
+    }
+}
+</style>

@@ -1,0 +1,151 @@
+package store_test
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/andresbott/aether/internal/model"
+	"github.com/andresbott/aether/internal/store"
+)
+
+func TestCreateAndGetLibrary(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "Main"}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	if lib.ID == 0 {
+		t.Fatal("expected ID to be set after Create")
+	}
+
+	got, err := s.GetLibrary(lib.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "Main" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestGetLibraryNotFound(t *testing.T) {
+	s := testStore(t)
+	_, err := s.GetLibrary(999)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound, got %v", err)
+	}
+}
+
+func TestListLibraries(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateLibrary(&model.Library{Name: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateLibrary(&model.Library{Name: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	libs, err := s.ListLibraries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(libs) != 2 {
+		t.Fatalf("expected 2 libraries, got %d", len(libs))
+	}
+}
+
+func TestCreateLibraryDuplicateName(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateLibrary(&model.Library{Name: "Main"}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.CreateLibrary(&model.Library{Name: "Main"})
+	if err == nil {
+		t.Fatal("expected duplicate-name error")
+	}
+}
+
+func TestUpdateLibrary(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "Main", DefaultView: "albums"}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	lib.Name = "Renamed"
+	lib.DefaultView = "artists"
+	if err := s.UpdateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetLibrary(lib.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "Renamed" || got.DefaultView != "artists" {
+		t.Fatalf("update did not persist: %+v", got)
+	}
+}
+
+// A library is a view: deleting it must leave every track in place.
+func TestDeleteLibraryKeepsTracks(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	lib := &model.Library{Name: "L", Filters: scanFolderFilter("L")}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	album := model.Album{Name: "A", NameNorm: "a", AlbumArtistNorm: "x"}
+	db.Create(&album)
+	db.Create(&model.Track{AlbumID: album.ID, ScanFolder: "L", Filename: "1.mp3", FilePath: "/l/1.mp3"})
+
+	if err := s.DeleteLibrary(t.Context(), lib.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetLibrary(lib.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected the library gone, got %v", err)
+	}
+	var n int64
+	db.Model(&model.Track{}).Count(&n)
+	if n != 1 {
+		t.Fatalf("expected the track to survive, got %d", n)
+	}
+}
+
+func TestCreateLibraryHideFromArtistIndexRoundTrip(t *testing.T) {
+	s := testStore(t)
+	lib := &model.Library{Name: "Main", Filters: scanFolderFilter("Main"), HideFromArtistIndex: true}
+	if err := s.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetLibrary(lib.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HideFromArtistIndex {
+		t.Fatal("expected HideFromArtistIndex to persist on create")
+	}
+	if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
+		t.Fatalf("expected timestamps to be set on create, got created=%v updated=%v", got.CreatedAt, got.UpdatedAt)
+	}
+}
+
+// The root library's settings answer the defaults until saved, and a saved
+// false survives — the column has no default to turn it back into true.
+func TestCatalogSettingsDefaultsAndRoundTrip(t *testing.T) {
+	s := testStore(t)
+	got, err := s.GetCatalogSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != model.DefaultCatalogSettings() {
+		t.Fatalf("got %+v before any save, want the defaults", got)
+	}
+	for _, split := range []bool{false, true, false} {
+		if err := s.SaveCatalogSettings(model.CatalogSettings{SplitViews: split}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err = s.GetCatalogSettings(); err != nil {
+			t.Fatal(err)
+		}
+		if got.SplitViews != split {
+			t.Fatalf("saved split_views=%v, read back %v", split, got.SplitViews)
+		}
+	}
+}

@@ -1,0 +1,286 @@
+@use 'variables';
+/* After variables so the hidden palettes override the .dark-mode tokens. */
+@use 'hidden-themes';
+
+* {
+    box-sizing: border-box;
+}
+
+/* The app-shell height chain: <html> is the ONE viewport-sized box and
+   everything under it is 100% of it. `dvh`, not `vh`: on mobile browsers
+   `100vh` is the URL-bar-HIDDEN (large) viewport, so the document ends up
+   taller than the screen and the PAGE scrolls — the scaffold header (with the
+   hamburger) slides under the URL bar and the shell-less tail of #app shows as
+   dead space above the system nav. Device emulation never reproduces it: with
+   no retractable URL bar, vh == dvh there. Only real phones show it. */
+html {
+    height: 100dvh;
+    overflow: hidden;
+    /* Nothing scrolls the document — every scroller in the app is an inner one
+       — so drop the page-level rubber band and pull-to-refresh with it. */
+    overscroll-behavior: none;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: var(--font-sans);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: var(--app-background);
+    color: var(--app-text-primary);
+    line-height: 1.4;
+    overflow: hidden;
+}
+
+#app {
+    width: 100%;
+    height: 100%;
+}
+
+/* Scrollbar chrome is a POINTER affordance, hence the pointer gate: styling
+   ::-webkit-scrollbar at all opts mobile Chrome out of the platform's
+   auto-hiding overlay scrollbars — the bars become permanently visible classic
+   ones that also claim layout width. Touch surfaces get no bars at all (an 8px
+   drag target is not usable with a thumb anyway), which also keeps
+   useScrollbarWidth's probe at 0 there, so the recipes reserve no rail/scrollbar
+   clearance on phones. */
+@media (pointer: fine) {
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: var(--app-border);
+        border-radius: 2px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--app-text-secondary);
+    }
+}
+
+@media (pointer: coarse) {
+    * {
+        scrollbar-width: none;
+    }
+
+    *::-webkit-scrollbar {
+        display: none;
+    }
+}
+
+*:focus-visible {
+    outline: 2px solid var(--app-accent);
+    outline-offset: 2px;
+}
+
+::selection {
+    background-color: var(--app-accent);
+    color: white;
+}
+
+img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+}
+
+a {
+    color: var(--app-accent);
+    text-decoration: none;
+    transition: color 0.2s ease;
+}
+
+a:hover {
+    color: var(--app-accent-hover);
+}
+
+/* Dialog footers read confirm | cancel (confirm on the left, Cancel rightmost).
+   PrimeVue and our dialog markup put Cancel first in the DOM, so reverse the
+   footer visually. This is visual-only; keyboard focus order still reaches
+   Cancel first — the safer default focus. Single source of truth for the order;
+   see docs/architecture/unified-edit-experience.md. Footers with extra buttons
+   (e.g. a destructive action pinned far left via a spacer) must author their
+   DOM in reverse. */
+.p-dialog .p-dialog-footer {
+    display: flex;
+    flex-direction: row-reverse;
+    /* The theme right-aligns the footer with justify-content: flex-end; under
+       row-reverse that would pack the reversed pair to the LEFT. flex-start
+       points right in a reversed row, so it keeps the group flush right. */
+    justify-content: flex-start;
+}
+
+/* Opt-in wider tooltip for explanatory help text that reads as a short
+   paragraph rather than a label. The theme caps .p-tooltip at
+   tooltip.max.width (~12.5rem), which wraps prose into a tall narrow ribbon.
+   Global because a tooltip renders in a body-level overlay, out of reach of the
+   originating component's scoped styles. */
+.p-tooltip.wide-tooltip {
+    max-width: 26rem;
+}
+
+/* Shared centered content column for main content views. Content inside is at
+   most --app-content-max-width wide; the gutter keeps it off the edges when
+   the pane is narrower. See docs/architecture/main-content-view-layout.md. */
+.content-col {
+    width: 100%;
+    max-width: calc(var(--app-content-max-width) + 2 * var(--app-content-gutter));
+    margin-inline: auto;
+    padding-inline: var(--app-content-gutter);
+    box-sizing: border-box;
+}
+
+// Main route-view pane, shared by DesktopShell and MobileShell.
+.main-content {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background-color: var(--app-background);
+    padding: 1rem 2rem;
+}
+
+@media (max-width: (variables.$bp-phone-max - 0.02px)) {
+    .main-content {
+        padding: 1rem;
+    }
+}
+
+// Full-bleed routes (those with `meta: { flush: true }`) manage their own
+// horizontal gutter (header + body) and self-scroll, so drop the side and bottom
+// padding here and let the scroll area reach the content-area edges (scroll bar
+// flush right). Keep a small TOP padding for a bit of breathing room above the
+// header — enough to lift it off the edge, but far less than the default 1rem
+// that used to push the header (and its back button) down.
+// Declared last so it also wins inside the media query above.
+.main-content--flush {
+    padding: 0.5rem 0 0;
+}
+
+// Bottom sheets (Drawer position="bottom") size to their content instead of the
+// fixed 10rem @primeuix's styled mode gives every bottom drawer
+// (`.p-drawer-bottom .p-drawer { height: 10rem }`) — at that height only about two
+// rows showed and the rest hid behind an unlabelled scroll.
+//
+// Global because a Drawer renders in a body-level overlay, out of reach of the
+// originating component's scoped styles (same reason as .wide-tooltip above), and
+// opt-in via a class so side drawers keep their own sizing. The selector has to
+// repeat `.p-drawer-bottom` to out-specify the theme's two-class rule: a lone
+// `.app-bottom-sheet` loses on specificity, and matching it exactly would leave the
+// winner up to stylesheet injection order.
+//
+// Hosts: TrackActionSheet.vue.
+.p-drawer-bottom .p-drawer.app-bottom-sheet {
+    height: auto;
+    max-height: 80dvh;
+}
+
+// The theme also pins the content box to height: 100%, which fights the auto-height
+// panel; let it size to its rows and scroll only once the cap is hit.
+.p-drawer-bottom .p-drawer.app-bottom-sheet .p-drawer-content {
+    height: auto;
+    overflow-y: auto;
+}
+
+// Phone: form dialogs become full-screen sheets (spec §3.2). One global rule
+// rather than per-dialog CSS so every current and future Dialog conforms.
+// Confirm popups are exempt — a full-screen "Are you sure?" reads as a new
+// page, not a question.
+@media (max-width: (variables.$bp-phone-max - 0.02px)) {
+    .p-dialog:not(.p-confirmdialog) {
+        width: 100vw !important;
+        max-width: 100vw;
+        height: 100dvh;
+        max-height: 100dvh;
+        margin: 0;
+        border-radius: 0;
+    }
+
+    .p-dialog:not(.p-confirmdialog) .p-dialog-content {
+        flex: 1;
+        overflow-y: auto;
+    }
+}
+
+/* Header controls — Library's Discover/Albums/… tabs, the List/Grid layout
+   toggles and Search's scope filter (all SelectButtons), plus the favorites
+   filter (a standalone ToggleButton) — rendered as a compact, bordered segmented
+   control on a light surface: a white/surface control, grey inactive options,
+   and the active one filled with a soft accent tint + accent text/icon. Aura's
+   raised inset pill and grey track are dropped — the tint fills the whole cell
+   and the options stay attached (shared borders), so nothing floats or gaps.
+   color-mix keeps the tints solid over the surface in light and dark, matching
+   the sidebar's active-nav accent.
+
+   Opt-in via the class so per-row and form controls (track selection, the Theme
+   picker) keep the default segmented look. Global, not scoped: on phones
+   ContentScaffold moves #secondary-actions into a body-level Popover, out of
+   reach of a view's scoped styles. See https://primevue.dev/button/#buttongroup. */
+.p-selectbutton.as-button-group .p-togglebutton,
+.p-togglebutton.as-button-group {
+    /* One fixed height across every header control (tabs, layout, heart, add)
+       so the row stays flush no matter the content — an icon otherwise makes a
+       togglebutton taller than the icon-only buttons beside it. */
+    height: 2.125rem;
+    box-sizing: border-box;
+    background: var(--app-surface-2);
+    border-color: var(--app-border);
+    color: var(--app-text-secondary);
+    font-size: 0.875rem;
+}
+
+.p-selectbutton.as-button-group .p-togglebutton:not(.p-togglebutton-checked):not(:disabled):hover,
+.p-togglebutton.as-button-group:not(.p-togglebutton-checked):not(:disabled):hover {
+    background: color-mix(in srgb, var(--app-accent) 7%, var(--app-surface-2));
+    color: var(--app-text-primary);
+}
+
+.p-selectbutton.as-button-group .p-togglebutton.p-togglebutton-checked,
+.p-togglebutton.as-button-group.p-togglebutton-checked {
+    background: color-mix(in srgb, var(--app-accent) 12%, var(--app-surface-2));
+    border-color: var(--app-border);
+    color: var(--app-accent);
+}
+
+.p-selectbutton.as-button-group .p-togglebutton.p-togglebutton-checked:not(:disabled):hover,
+.p-togglebutton.as-button-group.p-togglebutton-checked:not(:disabled):hover {
+    background: color-mix(in srgb, var(--app-accent) 20%, var(--app-surface-2));
+}
+
+/* Drop the raised inner pill (fill + shadow) so the active option sits flush. */
+.p-selectbutton.as-button-group .p-togglebutton.p-togglebutton-checked .p-togglebutton-content,
+.p-togglebutton.as-button-group.p-togglebutton-checked .p-togglebutton-content {
+    background: transparent;
+    box-shadow: none;
+}
+
+/* Icons (List/Grid, the favorites heart) follow their button's colour in every
+   state; the hover/checked selectors out-specify Aura's own icon-colour rules. */
+.p-selectbutton.as-button-group .p-togglebutton-icon,
+.p-togglebutton.as-button-group .p-togglebutton-icon,
+.p-togglebutton.as-button-group:not(:disabled):not(.p-togglebutton-checked):hover .p-togglebutton-icon,
+.p-togglebutton.as-button-group.p-togglebutton-checked .p-togglebutton-icon {
+    color: inherit;
+}
+
+/* Compact icons — sized to sit with the smaller label rather than the default
+   1rem. Covers the custom tab/scope glyphs (bare .ms-* in the #option slot)
+   and the built-in heart/layout icons. */
+.p-selectbutton.as-button-group [class^='ms-'],
+.p-selectbutton.as-button-group [class*=' ms-'],
+.p-selectbutton.as-button-group [class^='mso-'],
+.p-selectbutton.as-button-group [class*=' mso-'],
+.p-togglebutton.as-button-group [class^='ms-'],
+.p-togglebutton.as-button-group [class*=' ms-'],
+.p-togglebutton.as-button-group [class^='mso-'],
+.p-togglebutton.as-button-group [class*=' mso-'] {
+    font-size: 0.95rem;
+}

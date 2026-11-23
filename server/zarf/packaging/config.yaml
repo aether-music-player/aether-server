@@ -1,0 +1,164 @@
+# Aether server configuration (package defaults).
+#
+# Loaded automatically from /etc/aether/config.yaml. Every value can also be set
+# via environment variables prefixed with AETHER_ (e.g. AETHER_SERVER_PORT=8080),
+# which take precedence over this file.
+#
+# This file is marked as a dpkg conffile: your edits survive package upgrades.
+
+Server:
+  Port: 8075
+  # Bind address. What empty means depends on Auth.Method: with "none" it is
+  # 127.0.0.1 (localhost only), and a wildcard like 0.0.0.0 is refused at
+  # startup; with "native"/"proxy-header" it is all interfaces. Set to
+  # 127.0.0.1 when a reverse proxy (nginx/Traefik/Caddy, optionally with
+  # Authelia) on the same host fronts the server.
+  BindIp: ""
+
+# Observability endpoints (health, metrics). Off by default; when enabled, keep
+# it off the public interface.
+Observability:
+  Enabled: false
+  Port: 9009
+  BindIp: "127.0.0.1"
+
+# Database, cached artwork and task logs live here. Owned by the aether user.
+DataDir: "/var/lib/aether"
+
+# The directories Aether scans for music. They are declared HERE and nowhere
+# else: there is no database row and no UI to add one, so what gets scanned is
+# exactly what this list says. Restart to apply a change.
+#
+#   Name             identifies the folder: tracks remember the name of the folder
+#                    they were indexed under, and library filters refer to it.
+#                    Renaming a folder takes effect on the next scan. Libraries
+#                    whose filters name the OLD name keep matching its tracks
+#                    until that scan re-labels them, then match nothing until
+#                    they are edited: Settings → Libraries marks them "Needs
+#                    attention" and the server warns at startup.
+#   Path             root directory. Roots must not be equal or nested. Must
+#                    be the real directory: a root that is itself a symlink
+#                    is refused (symlinks INSIDE a root are followed when
+#                    FollowSymlinks is true). A relative path resolves
+#                    against the server's working directory, not this
+#                    file's directory — use an absolute path.
+#   ExcludePatterns  list of Go regexes; matching files/directories are skipped
+#                                                                    (default: none)
+#                    A pattern starting with "@" is read as a FILE PATH by the
+#                    config loader, not a regex — write the Synology "@eaDir"
+#                    exclude as "^@eaDir$" or "[@]eaDir".
+#   FollowSymlinks   follow symlinked folders while scanning         (default: true)
+#                    Content reached through a link is stored under the link's
+#                    TARGET. If that target lies outside every Path listed here,
+#                    those tracks are listed but do not play (known limitation):
+#                    list the target directory as a scan folder of its own (it
+#                    must not contain another scan folder: roots cannot nest).
+#
+# A directory that is missing at startup (a share that mounts late) is only a
+# warning: the server starts, and scans refuse to run until it is back.
+#
+# With NO scan folder configured at all nothing is scanned and no on-disk media
+# is served: a populated index is still listed, but nothing plays.
+#
+# REMOVING an entry removes its tracks at the next scan — together with their
+# stars, playlist entries and play history. The server warns at startup when
+# indexed tracks belong to a folder that is no longer listed.
+#
+# CHANGING a Path keeps a folder's tracks (ids, stars, playlists, history)
+# only if the old location is gone by the next scan — a move or rename. If
+# the old copy still exists then (e.g. copied to a new disk and repointed),
+# nothing is re-linked: new rows are created and the old ones are swept
+# instead.
+#
+# What users browse — "libraries" — is NOT configured here. A library is a saved
+# filter over the scanned catalog (by scan folder, folder path, file format,
+# release type, compilation or genre), created in Settings → Libraries.
+# Deleting a library never deletes music; removing a scan folder does.
+#
+# ScanFolders:
+#   - Name: "Music"
+#     Path: "/srv/music"
+#   - Name: "Audiobooks"
+#     Path: "/srv/audiobooks"
+#     ExcludePatterns:
+#       - ".*/covers/.*"
+#     FollowSymlinks: false
+
+# Authentication. Three methods:
+#
+#   "none"         — no authentication (trusted LAN only).
+#   "native"       — users stored in the aether database; aether renders its
+#                    own login form and manages sessions.
+#   "proxy-header" — identity comes from headers injected by an authenticating
+#                    reverse proxy (Authelia, Authentik, oauth2-proxy). Aether
+#                    never shows a login form; users are created automatically
+#                    on first sight.
+#
+# --- Method "none": nothing else is needed. ---
+#
+# Auth:
+#   Method: "none"
+#
+# --- Method "native": AdminBootstrap seeds the initial admin, only while the
+# user store is empty (idempotent bootstrap) — changing it later has no effect
+# on an already-seeded store. Prefer a bcrypt hash over a plaintext password in
+# this world-readable file (generate one with `aether user hash`), or reference
+# a root-only file. ---
+#
+# Auth:
+#   Method: "native"
+#   AdminBootstrap:
+#     User: "admin"
+#     Pw: "@/etc/aether/admin.password"            # or "$2y$..." or plaintext
+#
+# --- Method "proxy-header": AdminBootstrap is ignored; the
+# ProxyHeader block configures which headers carry identity and who is
+# allowed to assert them. Deployment invariants: aether MUST be unreachable
+# except through the proxy (set BindIp: "127.0.0.1" above), the proxy MUST
+# strip inbound identity headers on every request, and /rest MUST be bypassed
+# at the proxy so Subsonic clients can authenticate with their apiKey.
+# Members of AdminGroup (per the groups header) get the admin role. ---
+#
+# Auth:
+#   Method: "proxy-header"
+#   ProxyHeader:
+#     # Header names below are Authelia's defaults; for oauth2-proxy use
+#     # X-Forwarded-User / X-Forwarded-Groups.
+#     UserHeader: "Remote-User"
+#     GroupsHeader: "Remote-Groups"
+#     AdminGroup: "aether-admin"
+#     # CIDRs or bare IPs allowed to assert identity headers. Strongly
+#     # recommended; empty trusts every peer that can reach the server
+#     # (a startup warning reminds of this). List BOTH loopback forms when the
+#     # proxy is co-located: a proxy dialing "localhost" arrives as ::1, and a
+#     # missing entry rejects the headers silently.
+#     TrustedProxies:
+#       - "127.0.0.1"
+#       - "::1"
+#       - "10.0.0.0/8"
+Auth:
+  Method: "none"
+  AdminBootstrap:
+    User: "admin"
+    Pw: "admin"
+
+Env:
+  LogLevel: "info"
+  Production: true
+
+TaskRunner:
+  Parallelism: 2
+  QueueSize: 20
+  HistorySize: 50
+  # 0 -> derived from the CPU count.
+  TagReadWorkers: 0
+  # Per-execution task logs. Empty -> <DataDir>/task-logs.
+  LogDir: ""
+
+# Artist image fetching. Provide at least one provider API key to enable it;
+# with both empty the "fetch-artist-images" task reports "not configured".
+# A value starting with "@" is read from that file's content, e.g.
+# "@/etc/aether/fanart.api.key" — keeps the key out of this world-readable file.
+ArtistImages:
+  FanartApiKey: ""
+  TheAudioDBApiKey: ""

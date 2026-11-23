@@ -1,0 +1,46 @@
+import { apiClient } from '@/lib/api/client'
+import { isMeResponse, NotAetherMeError } from '@/lib/api/meShape'
+import type {
+    MeResponse,
+    User,
+    CreateUserInput,
+    UpdateUserInput,
+    ListUsersResponse
+} from '@/types/users'
+
+// The SPA's bootstrap, so it is bounded: a server that silently drops packets
+// would otherwise hold the window blank until the system gave up on the
+// connection, minutes later, and again for every retry. A healthy server
+// answers in milliseconds.
+const ME_TIMEOUT_MS = 10_000
+
+/**
+ * The SPA's bootstrap. Rejects an answer that is not Aether's /me: in the
+ * desktop app a saved address can come to answer 200 with something else
+ * (another web app on that port, a captive portal's page), and taken for /me it
+ * would render the app against it. Failing, it brings the server step back.
+ */
+export async function getMe(): Promise<MeResponse> {
+    const { data } = await apiClient.get<unknown>('/me', { timeout: ME_TIMEOUT_MS })
+    if (!isMeResponse(data)) throw new NotAetherMeError()
+    return data
+}
+
+export async function listUsers(): Promise<User[]> {
+    const { data } = await apiClient.get<ListUsersResponse>('/users')
+    return data.users ?? []
+}
+
+export async function createUser(input: CreateUserInput): Promise<User> {
+    const { data } = await apiClient.post<User>('/users', input)
+    return data
+}
+
+export async function updateUser(id: string, input: UpdateUserInput): Promise<User> {
+    const { data } = await apiClient.put<User>(`/users/${encodeURIComponent(id)}`, input)
+    return data
+}
+
+export async function deleteUser(id: string): Promise<void> {
+    await apiClient.delete(`/users/${encodeURIComponent(id)}`)
+}
