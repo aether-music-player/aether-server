@@ -1,6 +1,6 @@
 # Web UI (webui/) checks: type-check + unit tests, then the production build
-# the server embeds and the player opens, so a build break is caught before a
-# release. Shows up on a PR as `webui / test`.
+# the server embeds (and the desktop player, in its own repo, opens), so a
+# build break is caught before a release. Shows up on a PR as `webui / test`.
 name: webui
 
 on:

@@ -2,9 +2,10 @@
 
 Releases are goreleaser builds triggered by pushing a `v*.*.*` tag
 (`.github/workflows/release.yml`). Aether ships as a **single binary with the
-SPA embedded**, so the UI build step is part of every release path. The same
-tag also publishes the **desktop player** bundles (`player/`, Tauri) for Linux,
-Windows and macOS — see [The desktop player bundles](#the-desktop-player-bundles).
+SPA embedded**, so the UI build step is part of every release path. The
+desktop player lives in its own repo and is released from there; it consumes
+the SPA through this release's `aether-spa.zip` (see
+[The web UI archive](#the-web-ui-archive)).
 
 ## Cutting a release
 
@@ -26,10 +27,6 @@ yourself first.
   built-in `GITHUB_TOKEN`, `packages: write`) run before goreleaser for the
   image.
 - **`server (macos)`**: same UI build, goreleaser with `.goreleaser-darwin.yaml`.
-- **`player (…)`**, one job per OS/arch (`linux` on `ubuntu-22.04`, `windows`,
-  `macos arm64`, `macos x64`), after the Linux job: `npm ci` in `webui/` and
-  `player/`, `npx tauri build` with the tag's version, then `gh release upload`
-  of the bundles onto the release goreleaser created — see below.
 - **`site`**: after the Linux job, for stable tags only (no `-` in the tag),
   builds `site/` with Hugo and deploys it to GitHub Pages — see below.
 
@@ -42,9 +39,6 @@ yourself first.
 | `windows` | windows/amd64 v1, v3 | zip |
 | `darwin` | darwin/amd64, darwin/arm64 | zip (separate config) |
 | — (archive `spa`) | the built web UI, no binary | `aether-spa.zip` |
-| player (`release.yml` matrix, not goreleaser) | linux/amd64 | `aether-player_<ver>_amd64.deb`, `…_amd64.AppImage` |
-| | windows/x64 | `aether-player_<ver>_x64-setup.exe` (NSIS) |
-| | darwin/arm64, darwin/x64 | `aether-player_<ver>_aarch64.dmg`, `…_x64.dmg` |
 
 ### GOAMD64: only v1 and v3
 
@@ -148,46 +142,6 @@ appends to the same release and would upload it twice. It is listed in
   release fails ("globbing failed for pattern webui/dist") instead of
   publishing an empty zip.
 
-## The desktop player bundles
-
-The `player` job of `release.yml` builds `player/` with Tauri on GitHub's
-runners and attaches the bundles to the release the Linux job created
-(`gh release upload --clobber`, so a rerun replaces rather than fails). They
-are **not** in `checksums.txt` — that file is goreleaser's. The player-side
-view is [player/releasing.md](player/releasing.md); what is easy to get wrong:
-
-- **The version comes from the tag**: `v1.2.3` → `1.2.3`, passed as
-  `npx tauri build --config '{"version":"1.2.3"}'` over the `0.1.0` in
-  `player/src-tauri/tauri.conf.json`. The app's `app_version` command reads
-  that same package version, so the UI and the installer agree.
-- **One format per OS, chosen so a prerelease tag still builds**
-  (`v1.2.3-rc1` → `1.2.3-rc1`): Linux gets a deb and an AppImage but no rpm (an
-  RPM `Version` cannot contain `-`); Windows gets the NSIS installer but no MSI
-  (WiX versions are numeric, so tauri rejects `rc1` there); macOS gets one dmg
-  per architecture — no universal binary, two smaller downloads, matching the
-  server's per-arch darwin zips.
-- **Linux builds on `ubuntu-22.04`, deliberately the oldest runner GitHub
-  hosts**: the deb and the AppImage link against the runner's glibc and
-  webkit2gtk, which sets the oldest system they install on (Debian 12 / Ubuntu
-  22.04). Bump it when GitHub retires the image, knowing that raises the floor.
-- **Ad-hoc signed on macOS, unsigned on Windows.** No Apple certificate or
-  Windows signing key is configured. `player/src-tauri/tauri.conf.json` sets
-  `bundle.macOS.signingIdentity: "-"`, so the `.app` carries an ad-hoc
-  signature: Gatekeeper still blocks the first launch, but with the **Open
-  Anyway** route in System Settings → Privacy & Security (or `xattr -cr`),
-  where it reports an unsigned bundle as "damaged" with no way through.
-  SmartScreen warns on Windows. Real signing is a repository-secrets change
-  (`APPLE_SIGNING_IDENTITY` overrides the `-`); the variables and the
-  empty-variable trap are in
-  [player/releasing.md](player/releasing.md#cautions).
-- `npx tauri build` runs the webui production build itself
-  (`beforeBuildCommand: npm --prefix ../webui run build`) and embeds
-  `webui/dist`, so the job only needs `npm ci` in both `webui/` and `player/`.
-  The Linux runner also needs the native build packages listed in the job
-  (webkit2gtk, appindicator, alsa, dbus, `patchelf` for the AppImage).
-- Local equivalent: `make player-build` bundles for the host OS into
-  `player/target/release/bundle/` with every format the host supports.
-
 ## The website
 
 `site/` (Hugo + hugo-book, authoring notes in `site/README.md`) is the public
@@ -263,11 +217,6 @@ working directory cannot shadow the packaged one.
 - **No backwards compatibility is promised** (pre-release, no users —
   CLAUDE.md). There are no schema migration guarantees between tags; do not
   add migration code to satisfy a release.
-- **The player's bundle identifier `dev.andresbott.aether.player` is
-  immutable.** Tauri derives the app's config and cache directories from it
-  (a change forgets every saved server and session) and it is what makes an
-  update the same app to the OS. The player's version is tauri's, not the
-  Rust crate's — see above.
 
 See [testing.md](testing.md) for the `make verify` gate and
 [architecture.md](architecture.md) for the embed/composition layout.

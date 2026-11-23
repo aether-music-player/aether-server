@@ -4,8 +4,7 @@
 vue-query, vue-router). Built output is copied into `app/spa/files/ui` and
 embedded in the Go binary (`make package-ui`); in the binary the SPA is the
 catch-all route behind `/api/v0` and `/rest`. **The same `webui/dist` is also
-the desktop player's window** (`player/`, Tauri — see
-[player/architecture.md](player/architecture.md)), served there from a
+the desktop player's window** (Tauri, in its own repo), served there from a
 `tauri://` origin rather than by the Go binary: keep the SPA origin-agnostic
 (no hardcoded origins, no server-side `index.html` templating, no cookie-only
 auth assumptions). Whatever differs inside the app goes through the host layer
@@ -308,8 +307,8 @@ Inside the desktop player the SPA runs from a `tauri://localhost` /
 `http://tauri.localhost` origin, so the server is not the page's origin, and a
 request the webview sends itself cannot reach it: cross-site, it would need
 CORS and would never carry the `SameSite=Lax` session cookie, and the window's
-CSP confines `connect-src` to IPC anyway (the Rust side and the why:
-[player/architecture.md](player/architecture.md)). **`lib/host/` is the one
+CSP confines `connect-src` to IPC anyway (the Rust side and the why are
+documented in the player repo). **`lib/host/` is the one
 place that knows** — `index.ts` (the API, imported as `@/lib/host`),
 `serverUrl.ts`, `session.ts`, `transport.ts`, `events.ts`. Everything else asks
 it and stays the same code in a tab and in the app.
@@ -371,7 +370,7 @@ reaches axios callers as its own `CanceledError`), so the detail views, which
 show `apiErrorMessage(error)`, say the server could not be reached and the
 connectivity banner comes up. Known gap: the metadata
 editor's picture previews and copy-picture bypass the transport and do not
-load in the app ([player/features.md](player/features.md)).
+load in the app (tracked in the player repo).
 
 **Two rules, pinned off disk by `lib/host/__tests__/originAgnostic.spec.ts`.**
 Outside `lib/host/`, no code reads `location.origin` — however it is reached
@@ -1144,9 +1143,8 @@ output.
 | `web/icon-square.svg` (full-bleed, opaque) | `apple-touch-icon.png` (180) | iOS home screen: Safari ignores manifest icons and applies its own corner mask, so this one must bleed into the corners and carry no alpha |
 | `web/icon-maskable.svg` (mark at 70%) | `icon-maskable-192.png`, `icon-maskable-512.png` | Android adaptive icons (`purpose: maskable`) only guarantee the inner 80% circle |
 
-The same `make icons` run renders the desktop player's app icon from
-`web/icon.svg` into `player/src-tauri/icons/` — see
-[player/releasing.md](player/releasing.md#cautions).
+The desktop player renders its app icon from the same `web/icon.svg`, in its
+own repo.
 
 **In-app brand mark.** The same artwork appears inside the UI as the diamond
 rendition: `assets/aether-mark.svg` (cleaned from `zarf/icon/icon.svg`), wrapped
