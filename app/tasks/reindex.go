@@ -1,0 +1,73 @@
+// app/tasks/reindex.go
+package tasks
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/aether-music-player/aether-server/internal/scanner"
+	"github.com/aether-music-player/aether-server/internal/store"
+	"github.com/aether-music-player/aether-server/internal/tags"
+)
+
+// LibraryWriteExclusionGroup serializes every task that writes to the index
+// over SQLite's single write lock. Both the scan and reindex tasks join
+// it, so an edit-triggered reindex never runs while a full/incremental scan is
+// in progress (and vice versa). See app/cmd/server.go registrations.
+const LibraryWriteExclusionGroup = "library-writes"
+
+const ReindexTaskName = "reindex"
+
+// ReindexParams carries the targeted re-index of the files a metadata edit just
+// wrote: the scan folder they live in and their absolute paths. Enqueued by the
+// /api/v0 metadata write handlers after the file write lands on disk.
+type ReindexParams struct {
+	ScanFolder string   `json:"scan_folder"`
+	Paths      []string `json:"paths"`
+}
+
+var ReindexTaskDef = TaskDef{
+	ID:          ReindexTaskName,
+	Name:        "Metadata Re-index",
+	Description: "Re-read and reconcile specific files after a metadata-editor write, without scanning the whole catalog. Enqueued automatically by the editor; not meant to be scheduled.",
+}
+
+// NewReindexTaskFn builds the reindex task body. It reuses one Scanner (as
+// NewScanTaskFn does) and calls RescanPaths, which re-reads the given files'
+// tags, reconciles them, and prunes only the aggregates the edit could have
+// emptied — never the whole-catalog Cleanup.
+func NewReindexTaskFn(cfg scanner.Config, s *store.Store, tagReader tags.Reader) func(ctx context.Context, log *slog.Logger, p ReindexParams) error {
+	sc := scanner.New(cfg, s, tagReader)
+	return func(ctx context.Context, log *slog.Logger, p ReindexParams) error {
+		// Deferred so it also runs after a failed or cancelled pass (see scan.go).
+		defer reconcileWishlist(s, log)
+		log.Info("starting metadata re-index",
+			slog.String("scan_folder", p.ScanFolder),
+			slog.Int("paths", len(p.Paths)))
+
+		stats, err := sc.RescanPaths(ctx, p.ScanFolder, p.Paths)
+		if err != nil {
+			log.Error("re-index failed", slog.String("error", err.Error()))
+			return err
+		}
+
+		log.Info("re-index complete",
+			slog.Int("processed", stats.TracksProcessed),
+			slog.Int("new", stats.TracksNew),
+			slog.Int("updated", stats.TracksUpdated),
+			slog.Int("skipped", stats.TracksSkipped),
+			slog.Int("failed", stats.TracksFailed))
+		if len(stats.Errors) > 0 {
+			// Per-file tag-read failures are logged, not fatal (mirrors the scan task).
+			log.Info("re-index had tag reading errors", slog.Int("count", len(stats.Errors)))
+		}
+		// Tracks that could not be saved even after a retry are a real shortfall,
+		// surfaced the same way the scheduled scan surfaces them — this path
+		// shares reconcile, so it shares the visibility.
+		if stats.TracksFailed > 0 {
+			log.Warn("re-index could not save some tracks; they were skipped and left unindexed",
+				slog.Int("failed", stats.TracksFailed))
+		}
+		return nil
+	}
+}

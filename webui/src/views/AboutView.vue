@@ -118,10 +118,10 @@ const buildTime = computed(() => serverVersion.value?.build_time || '')
                     <p>
                         Developed by Andres Bott —
                         <a
-                            href="https://github.com/andresbott/aether"
+                            href="https://github.com/aether-music-player/aether-server"
                             target="_blank"
                             rel="noopener"
-                            >github.com/andresbott/aether</a
+                            >github.com/aether-music-player/aether-server</a
                         >
                     </p>
                 </section>

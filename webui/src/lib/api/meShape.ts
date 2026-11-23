@@ -1,4 +1,4 @@
-// What makes an answer Aether's /me (server/app/router/handlers/me.go): the
+// What makes an answer Aether's /me (app/router/handlers/me.go): the
 // gate decides on it, so a 200 from something else at the same address — another
 // web app on that port, a captive portal's page, a proxy's default page — must
 // never pass for it. Shared by the bootstrap (getMe) and the desktop app's server

@@ -1,0 +1,437 @@
+package subsonic
+
+import (
+	"log/slog"
+	"net/http"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/aether-music-player/aether-server/internal/assetkey"
+	"github.com/aether-music-player/aether-server/internal/assetstore"
+	"github.com/aether-music-player/aether-server/internal/model"
+	"github.com/aether-music-player/aether-server/internal/store"
+)
+
+// visiblePlaylist loads a playlist the caller may READ: their own or a public
+// one. An existing-but-invisible playlist answers 70 (not found), not 50 —
+// visibility must not leak which private ids exist.
+func (h *Handler) visiblePlaylist(w http.ResponseWriter, r *http.Request, id uint) (*model.Playlist, bool) {
+	pl, err := h.store.GetPlaylist(id)
+	if err != nil || (pl.Owner != requestOwner(r) && !pl.Public) {
+		writeError(w, 70, "playlist not found")
+		return nil, false
+	}
+	return pl, true
+}
+
+// ownedPlaylist loads a playlist the caller may WRITE: only their own. A
+// visible-but-foreign playlist answers 50 (not authorized) — the caller could
+// read it, so hiding it as 70 would just be confusing.
+func (h *Handler) ownedPlaylist(w http.ResponseWriter, r *http.Request, id uint) (*model.Playlist, bool) {
+	pl, err := h.store.GetPlaylist(id)
+	if err != nil || (pl.Owner != requestOwner(r) && !pl.Public) {
+		writeError(w, 70, "playlist not found")
+		return nil, false
+	}
+	if pl.Owner != requestOwner(r) {
+		writeError(w, 50, "not authorized to modify this playlist")
+		return nil, false
+	}
+	return pl, true
+}
+
+// playlistToMap builds the Subsonic playlist object shared by getPlaylists and
+// getPlaylist. starredAt and stat are nil when the playlist is not starred /
+// never played, in which case "starred" and "played" are omitted — matching how
+// albums omit "starred". playCount is always present (0 when never played).
+func playlistToMap(pl *model.Playlist, songCount, duration int, starredAt *time.Time, stat *store.PlaylistStat) map[string]any {
+	m := map[string]any{
+		"id":        encodePlaylistID(pl.ID),
+		"name":      pl.Name,
+		"comment":   pl.Comment,
+		"owner":     pl.Owner,
+		"public":    pl.Public,
+		"songCount": songCount,
+		"duration":  duration,
+		"coverArt":  encodePlaylistID(pl.ID),
+		"created":   pl.CreatedAt,
+		"changed":   pl.UpdatedAt,
+		"playCount": 0,
+	}
+	if starredAt != nil {
+		m["starred"] = starredAt.Format(time.RFC3339)
+	}
+	if stat != nil {
+		m["playCount"] = stat.PlayCount
+		m["played"] = stat.LastPlayed.Format(time.RFC3339)
+	}
+	return m
+}
+
+func (h *Handler) getPlaylists(w http.ResponseWriter, r *http.Request) {
+	playlists, err := h.store.GetPlaylists(requestOwner(r))
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	// One batched lookup each for stars and play stats — the per-playlist track
+	// count/duration calls below are the pre-existing N+1 (TODO.md); do not add
+	// two more queries per row on top of it.
+	ids := make([]uint, 0, len(playlists))
+	for i := range playlists {
+		ids = append(ids, playlists[i].ID)
+	}
+	owner := requestOwner(r)
+	starredAt, err := h.store.StarredAt(owner, "playlist", ids)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	stats, err := h.store.PlaylistStats(owner, ids)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	trackStats, err := h.store.PlaylistTrackStats(ids)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	items := make([]map[string]any, 0, len(playlists))
+	for i := range playlists {
+		pl := playlists[i]
+		count := trackStats[pl.ID].Count
+		dur := trackStats[pl.ID].Duration
+		var starPtr *time.Time
+		if ts, ok := starredAt[pl.ID]; ok {
+			starPtr = &ts
+		}
+		var statPtr *store.PlaylistStat
+		if st, ok := stats[pl.ID]; ok {
+			statPtr = &st
+		}
+		items = append(items, playlistToMap(&pl, count, dur, starPtr, statPtr))
+	}
+	writeResponse(w, map[string]any{
+		"playlists": map[string]any{
+			"playlist": items,
+		},
+	})
+}
+
+func (h *Handler) getPlaylist(w http.ResponseWriter, r *http.Request) {
+	idStr := paramStr(r, "id")
+	if idStr == "" {
+		writeError(w, 10, "missing id parameter")
+		return
+	}
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "playlist" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	if _, ok := h.visiblePlaylist(w, r, id); !ok {
+		return
+	}
+	h.writePlaylistResponse(w, r, id)
+}
+
+// writePlaylistResponse loads a playlist plus its tracks and writes the full
+// Subsonic "playlist" object (with the entry list). Shared by getPlaylist and
+// createPlaylist. Writes error 70 if the playlist does not exist.
+func (h *Handler) writePlaylistResponse(w http.ResponseWriter, r *http.Request, id uint) {
+	pl, err := h.store.GetPlaylist(id)
+	if err != nil {
+		writeError(w, 70, "playlist not found")
+		return
+	}
+	tracks, err := h.store.GetPlaylistTracks(id)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	owner := requestOwner(r)
+	songs := starredSongList(h.store, owner, tracks)
+	var dur int
+	for i := range tracks {
+		dur += tracks[i].Duration
+	}
+	starredAt, err := h.store.StarredAt(owner, "playlist", []uint{pl.ID})
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	stats, err := h.store.PlaylistStats(owner, []uint{pl.ID})
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	var starPtr *time.Time
+	if ts, ok := starredAt[pl.ID]; ok {
+		starPtr = &ts
+	}
+	var statPtr *store.PlaylistStat
+	if st, ok := stats[pl.ID]; ok {
+		statPtr = &st
+	}
+	m := playlistToMap(pl, len(tracks), dur, starPtr, statPtr)
+	m["entry"] = songs
+	writeResponse(w, map[string]any{"playlist": m})
+}
+
+// createPlaylist creates a new playlist or, when playlistId is supplied, updates
+// the existing one — replacing its entire track list with the given songId set,
+// per the Subsonic spec. Returns the full playlist object.
+func (h *Handler) createPlaylist(w http.ResponseWriter, r *http.Request) {
+	trackIDs := decodeTrackIDs(paramStrSlice(r, "songId"))
+	public := paramBoolPtr(r, "public")
+
+	if idStr := paramStr(r, "playlistId"); idStr != "" {
+		h.recreatePlaylist(w, r, idStr, trackIDs, public)
+		return
+	}
+
+	name := paramStr(r, "name")
+	if name == "" {
+		writeError(w, 10, "missing name parameter")
+		return
+	}
+	isPublic := public != nil && *public
+	pl, err := h.store.CreatePlaylist(name, requestOwner(r), isPublic, trackIDs)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	h.writePlaylistResponse(w, r, pl.ID)
+}
+
+// recreatePlaylist handles the createPlaylist update-by-id path: it replaces the
+// playlist's entire track list with trackIDs and optionally updates name/public.
+func (h *Handler) recreatePlaylist(w http.ResponseWriter, r *http.Request, idStr string, trackIDs []uint, public *bool) {
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "playlist" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	if _, ok := h.ownedPlaylist(w, r, id); !ok {
+		return
+	}
+	var namePtr *string
+	if name := paramStr(r, "name"); name != "" {
+		namePtr = &name
+	}
+	if namePtr != nil || public != nil {
+		if err := h.store.UpdatePlaylist(id, namePtr, nil, public); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	}
+	if err := h.store.SetPlaylistTracks(id, trackIDs); err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	h.writePlaylistResponse(w, r, id)
+}
+
+// decodeTrackIDs turns Subsonic song IDs into internal track IDs, silently
+// dropping any that fail to decode.
+//
+// The type check is load-bearing: decodeID accepts every prefix, so an album or
+// playlist id would otherwise contribute its bare number and silently enqueue the
+// TRACK sharing that numeric id. Every caller here takes a typed song-id
+// parameter (songId, songIdToAdd, the play queue's id), so non-track ids are a
+// client error and get dropped.
+func decodeTrackIDs(songIDs []string) []uint {
+	trackIDs := make([]uint, 0, len(songIDs))
+	for _, s := range songIDs {
+		if kind, id, err := decodeID(s); err == nil && kind == "track" {
+			trackIDs = append(trackIDs, id)
+		}
+	}
+	return trackIDs
+}
+
+func (h *Handler) updatePlaylist(w http.ResponseWriter, r *http.Request) {
+	if isMultipart(r) {
+		h.updatePlaylistMultipart(w, r)
+		return
+	}
+	idStr := paramStr(r, "playlistId")
+	if idStr == "" {
+		writeError(w, 10, "missing playlistId parameter")
+		return
+	}
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "playlist" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	if _, ok := h.ownedPlaylist(w, r, id); !ok {
+		return
+	}
+	var namePtr, commentPtr *string
+	if r.URL.Query().Has("name") {
+		name := paramStr(r, "name")
+		namePtr = &name
+	}
+	if r.URL.Query().Has("comment") {
+		comment := paramStr(r, "comment")
+		commentPtr = &comment
+	}
+	public := paramBoolPtr(r, "public")
+	if namePtr != nil || commentPtr != nil || public != nil {
+		if err := h.store.UpdatePlaylist(id, namePtr, commentPtr, public); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	}
+	songIDsToAdd := paramStrSlice(r, "songIdToAdd")
+	if len(songIDsToAdd) > 0 {
+		if err := h.store.AddTracksToPlaylist(id, decodeTrackIDs(songIDsToAdd)); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	}
+	indicesToRemove := paramStrSlice(r, "songIndexToRemove")
+	indices := make([]int, 0, len(indicesToRemove))
+	for _, s := range indicesToRemove {
+		if idx, err := strconv.Atoi(s); err == nil {
+			indices = append(indices, idx)
+		}
+	}
+	sort.Ints(indices)
+	for i := len(indices) - 1; i >= 0; i-- {
+		if err := h.store.RemoveTrackFromPlaylist(id, indices[i]); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	}
+	writeResponse(w, nil)
+}
+
+// updatePlaylistCover handles the cover image upload or clear for a playlist in
+// updatePlaylist's multipart path. It reads the cover file from the request,
+// derives the asset key from the playlist's UUID, and either stores the new
+// cover or deletes it based on the coverClear flag. Empty-UUID playlists (legacy
+// rows) are skipped with a warning log.
+func (h *Handler) updatePlaylistCover(w http.ResponseWriter, r *http.Request, id uint) {
+	coverBytes, coverExt, err := readCoverFile(r)
+	if err != nil {
+		writeError(w, 0, err.Error())
+		return
+	}
+
+	// Reload the playlist to get the UUID for the asset key.
+	pl, err := h.store.GetPlaylist(id)
+	if err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	key := assetkey.PlaylistOf(pl)
+	if key == "" {
+		// Empty UUID means no cover (legacy row). Log and skip the asset-store call.
+		if coverBytes != nil || r.Form.Get("coverClear") == "true" {
+			slog.Warn("playlist cover write skipped: empty UUID", "playlist_id", id)
+		}
+		writeResponse(w, nil)
+		return
+	}
+
+	switch {
+	case coverBytes != nil:
+		if err := h.assets.PutManual(assetstore.KindPlaylist, key, coverExt, coverBytes); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	case r.Form.Get("generateStyle") != "":
+		data, ok := h.renderRequestedCover(w, r, "playlist", id)
+		if !ok {
+			return
+		}
+		if err := h.assets.PutManual(assetstore.KindPlaylist, key, "png", data); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	case r.Form.Get("coverClear") == "true":
+		_ = h.assets.Delete(assetstore.KindPlaylist, key)
+		_ = h.images.Delete(assetstore.KindPlaylist, key)
+	}
+
+	writeResponse(w, nil)
+}
+
+// updatePlaylistMultipart handles the OpenSubsonic "playlistCoverArt" extension:
+// a multipart updatePlaylist request that carries an optional cover image
+// ("coverFile") or a "coverClear" flag, alongside the usual name/comment/public
+// fields. Mirrors updateRadioMultipart in radio.go.
+func (h *Handler) updatePlaylistMultipart(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCoverRequestBytes)
+	if err := r.ParseMultipartForm(coverMultipartMemory); err != nil { //nolint:gosec // G120: body is bounded by http.MaxBytesReader on the previous line
+		writeError(w, 0, "invalid multipart body")
+		return
+	}
+	idStr := r.Form.Get("playlistId")
+	if idStr == "" {
+		writeError(w, 10, "missing playlistId parameter")
+		return
+	}
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "playlist" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	if _, ok := h.ownedPlaylist(w, r, id); !ok {
+		return
+	}
+
+	var namePtr, commentPtr *string
+	if r.Form.Has("name") {
+		name := r.Form.Get("name")
+		namePtr = &name
+	}
+	if r.Form.Has("comment") {
+		comment := r.Form.Get("comment")
+		commentPtr = &comment
+	}
+	var public *bool
+	if r.Form.Has("public") {
+		b := r.Form.Get("public") == "true"
+		public = &b
+	}
+	if namePtr != nil || commentPtr != nil || public != nil {
+		if err := h.store.UpdatePlaylist(id, namePtr, commentPtr, public); err != nil {
+			writeError(w, 0, "internal error")
+			return
+		}
+	}
+
+	h.updatePlaylistCover(w, r, id)
+}
+
+func (h *Handler) deletePlaylist(w http.ResponseWriter, r *http.Request) {
+	idStr := paramStr(r, "id")
+	if idStr == "" {
+		writeError(w, 10, "missing id parameter")
+		return
+	}
+	kind, id, err := decodeID(idStr)
+	if err != nil || kind != "playlist" {
+		writeError(w, 0, "invalid id")
+		return
+	}
+	pl, ok := h.ownedPlaylist(w, r, id)
+	if !ok {
+		return
+	}
+	key := assetkey.PlaylistOf(pl)
+	if err := h.store.DeletePlaylist(id); err != nil {
+		writeError(w, 0, "internal error")
+		return
+	}
+	if key != "" {
+		_ = h.assets.Delete(assetstore.KindPlaylist, key)
+		_ = h.images.Delete(assetstore.KindPlaylist, key)
+	}
+	writeResponse(w, nil)
+}

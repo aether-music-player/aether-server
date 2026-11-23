@@ -1,4 +1,4 @@
-# Server (server/) checks: Go tests + coverage, golangci-lint, the license
+# Server checks: Go tests + coverage, golangci-lint, the license
 # check and the OpenAPI spec lint. One job each, so they run in parallel and
 # fail independently; each shows up on a PR as `server / <job>`.
 name: server
@@ -22,8 +22,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: 'server/go.mod'
-          cache-dependency-path: server/go.sum
+          go-version-file: 'go.mod'
+          cache-dependency-path: go.sum
 
       - name: run tests
         run: make test
@@ -40,7 +40,7 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: true
-          cache-dependency-path: server/go.sum
+          cache-dependency-path: go.sum
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
@@ -48,7 +48,6 @@ jobs:
           # Pin the exact version so the bundled gosec ruleset matches local
           # runs; version skew makes nolintlint flag directives inconsistently.
           version: v2.13.2
-          working-directory: server
 
   license-check:
     runs-on: ubuntu-latest
@@ -61,7 +60,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.25.4'
-          cache-dependency-path: server/go.sum
+          cache-dependency-path: go.sum
 
       - name: Install go-licence-detector
         run: |

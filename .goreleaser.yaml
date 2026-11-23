@@ -9,9 +9,6 @@ builds:
   # with no runtime fallback: a too-new binary dies with SIGILL at startup.
   # =====================================================================================
   - id: linux
-    # The Go module lives in server/; every other path in this file is
-    # relative to the repo root.
-    dir: server
     goos:
       - linux
     goarch:
@@ -28,9 +25,9 @@ builds:
       - nodynamic
     ldflags:
       - -s -w
-      - -X github.com/andresbott/aether/app/metainfo.Version={{.Version}}
-      - -X github.com/andresbott/aether/app/metainfo.BuildTime={{.Date}}
-      - -X github.com/andresbott/aether/app/metainfo.ShaVer={{.Commit}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.Version={{.Version}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.BuildTime={{.Date}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.ShaVer={{.Commit}}
     binary: aether
     # Pure Go: the SQLite driver (glebarez/modernc) and taglib (wazero/wasm)
     # need no C toolchain. CGO_ENABLED=0 plus the nodynamic tag above yields a
@@ -45,7 +42,6 @@ builds:
   # Packaged as both zip and deb, same as the baseline.
   # =====================================================================================
   - id: linux-opt
-    dir: server
     goos:
       - linux
     goarch:
@@ -61,9 +57,9 @@ builds:
       - nodynamic
     ldflags:
       - -s -w
-      - -X github.com/andresbott/aether/app/metainfo.Version={{.Version}}
-      - -X github.com/andresbott/aether/app/metainfo.BuildTime={{.Date}}
-      - -X github.com/andresbott/aether/app/metainfo.ShaVer={{.Commit}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.Version={{.Version}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.BuildTime={{.Date}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.ShaVer={{.Commit}}
     binary: aether
     env:
       - CGO_ENABLED=0
@@ -72,7 +68,6 @@ builds:
   # Windows build
   # =====================================================================================
   - id: windows
-    dir: server
     goos:
       - windows
     goarch:
@@ -82,9 +77,9 @@ builds:
       - v3
     ldflags:
       - -s -w
-      - -X github.com/andresbott/aether/app/metainfo.Version={{.Version}}
-      - -X github.com/andresbott/aether/app/metainfo.BuildTime={{.Date}}
-      - -X github.com/andresbott/aether/app/metainfo.ShaVer={{.Commit}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.Version={{.Version}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.BuildTime={{.Date}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.ShaVer={{.Commit}}
     flags:
       - -trimpath
     binary: aether
@@ -140,7 +135,7 @@ nfpms:
       {{- else }}{{ .Arch }}{{ end }}
 
     maintainer: "Andres Bott <contact@andresbott.com>"
-    homepage: https://github.com/andresbott/aether
+    homepage: https://github.com/aether-music-player/aether-server
     license: AGPL-3.0
     section: sound
     description: |
@@ -171,9 +166,9 @@ nfpms:
         dst: /usr/share/doc/aether/README.md
       - src: LICENSE
         dst: /usr/share/doc/aether/LICENSE
-      - src: server/zarf/packaging/aether.service
+      - src: zarf/packaging/aether.service
         dst: /lib/systemd/system/aether.service
-      - src: server/zarf/packaging/config.yaml
+      - src: zarf/packaging/config.yaml
         dst: /etc/aether/config.yaml
         type: config|noreplace
       # Created by postinstall with aether:aether ownership; declared here so
@@ -184,13 +179,13 @@ nfpms:
           mode: 0750
 
     scripts:
-      preinstall: server/zarf/packaging/preinstall.sh
-      postinstall: server/zarf/packaging/postinstall.sh
-      preremove: server/zarf/packaging/preremove.sh
-      postremove: server/zarf/packaging/postremove.sh
+      preinstall: zarf/packaging/preinstall.sh
+      postinstall: zarf/packaging/postinstall.sh
+      preremove: zarf/packaging/preremove.sh
+      postremove: zarf/packaging/postremove.sh
 
 # =====================================================================================
-# Container image — ghcr.io/andresbott/aether, multi-arch (amd64 + arm64).
+# Container image — ghcr.io/aether-music-player/aether-server, multi-arch (amd64 + arm64).
 # Only the baseline `linux` build: linux-opt is also linux/amd64 and the two
 # would collide on the same platform; an image must run on any amd64 host.
 # Prereleases (v1.2.3-rc1) get only their exact version tag, never latest or
@@ -200,11 +195,11 @@ dockers_v2:
   - id: aether
     ids:
       - linux
-    dockerfile: server/zarf/docker/Dockerfile
+    dockerfile: zarf/docker/Dockerfile
     extra_files:
-      - server/zarf/docker/config.yaml
+      - zarf/docker/config.yaml
     images:
-      - "ghcr.io/andresbott/aether"
+      - "ghcr.io/aether-music-player/aether-server"
     tags:
       - "{{ .Version }}"
       - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
@@ -214,11 +209,11 @@ dockers_v2:
       - linux/arm64
     labels:
       # Links the ghcr package to the repository.
-      "org.opencontainers.image.source": "https://github.com/andresbott/aether"
+      "org.opencontainers.image.source": "https://github.com/aether-music-player/aether-server"
     annotations:
       "org.opencontainers.image.title": "aether"
       "org.opencontainers.image.description": "Music server with a web player and an OpenSubsonic-compatible API."
-      "org.opencontainers.image.source": "https://github.com/andresbott/aether"
+      "org.opencontainers.image.source": "https://github.com/aether-music-player/aether-server"
       "org.opencontainers.image.licenses": "AGPL-3.0"
       "org.opencontainers.image.version": "{{ .Version }}"
       "org.opencontainers.image.revision": "{{ .FullCommit }}"

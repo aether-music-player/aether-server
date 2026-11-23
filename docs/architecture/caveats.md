@@ -10,7 +10,7 @@ deployment assumption rather than by code, or (c) has candidate fixes worth
 recording but no chosen direction.
 
 This is not a work list. `TODO.md` carries the scheduled work and links here, and
-the site's [Known limitations](../../site/content/docs/about/limitations.md) page
+the site's [Known limitations](https://andresbott.github.io/aether/docs/about/limitations/) page
 tells users about the gaps recorded here that reach them.
 
 ---
@@ -23,7 +23,7 @@ that exact anchor. "Library root" there means a **scan folder**'s root — the d
 says "scan folder" throughout.*
 
 **Status:** accepted — out of reach under the mount assumption below, and listed
-for users on the site's [Known limitations](../../site/content/docs/about/limitations.md)
+for users on the site's [Known limitations](https://andresbott.github.io/aether/docs/about/limitations/)
 page. This entry merged the separate "unreadable subtree" item into it: an
 unreadable subtree and an unattached one fail identically from the scanner's side,
 and the EACCES flavour is already declined (see *Not this caveat*).
@@ -180,7 +180,7 @@ mounted into an empty NTFS folder, or a junction. Fix 1 is portable; fix 3 is no
 ## A move that straddles two scan runs
 
 **Status:** accepted — listed for users on the site's
-[Known limitations](../../site/content/docs/about/limitations.md) page. The fix is a
+[Known limitations](https://andresbott.github.io/aether/docs/about/limitations/) page. The fix is a
 feature with a UI, not a repair.
 **Affects:** `internal/scanner` — `planTrackContinuity` (`trackcontinuity.go`) vs.
 step 5 cleanup (`store.Cleanup`).
@@ -236,7 +236,7 @@ paid and cross-run re-linking is nearly free on top. It is not worth paying for 
 ## Artist id churn on rename
 
 **Status:** accepted — listed for users on the site's
-[Known limitations](../../site/content/docs/about/limitations.md) page. Genres have the
+[Known limitations](https://andresbott.github.io/aether/docs/about/limitations/) page. Genres have the
 same root cause.
 **Affects:** `internal/store/artist.go:21`, `internal/model/artist.go:8` (identity),
 `scan_helpers.go:75,83` (orphan cleanup), `internal/assetkey/assetkey.go:74-79`
@@ -424,7 +424,7 @@ which the design kept as its escape hatch.
 
 **Status:** accepted — upstream go-taglib's behaviour (sentriz/go-taglib `ed9dfe2`,
 "don't fail on tags with invalid UTF-8 or UTF-16"). Listed for users on the site's
-[Known limitations](../../site/content/docs/about/limitations.md) page.
+[Known limitations](https://andresbott.github.io/aether/docs/about/limitations/) page.
 **Affects:** `internal/tags` (`TaglibReader.Read`, `ReadRawTags`) and every
 `internal/metadataedit` write — tags, raw tags, embedded pictures.
 **Failure mode:** silent data loss. A read drops the field; for invalid UTF-8 the

@@ -19,7 +19,7 @@ yourself first.
 ## What CI does on a tag
 
 - **`server (linux + windows)`** (ubuntu-latest): `npm ci` + `make package-ui` (build
-  the SPA and copy it into `server/app/spa/files/ui/` — the `//go:embed files/ui/*`
+  the SPA and copy it into `app/spa/files/ui/` — the `//go:embed files/ui/*`
   in `app/spa/spa.go` picks it up), then goreleaser with `.goreleaser.yaml`
   (its builds set `dir: server`, the Go module root)
   (binary name `aether`, `CGO_ENABLED=0`, deb packages, GitHub release,
@@ -27,8 +27,6 @@ yourself first.
   built-in `GITHUB_TOKEN`, `packages: write`) run before goreleaser for the
   image.
 - **`server (macos)`**: same UI build, goreleaser with `.goreleaser-darwin.yaml`.
-- **`site`**: after the Linux job, for stable tags only (no `-` in the tag),
-  builds `site/` with Hugo and deploys it to GitHub Pages — see below.
 
 ## Build artifacts
 
@@ -65,7 +63,7 @@ two candidates for the same package+architecture.
 
 ## The Debian package
 
-Contents and lifecycle (assets in `server/zarf/packaging/`):
+Contents and lifecycle (assets in `zarf/packaging/`):
 
 | Path | Notes |
 |---|---|
@@ -101,8 +99,8 @@ plain `apt install aether` should get the full feature set:
 
 ## The container image
 
-`ghcr.io/andresbott/aether`, linux/amd64 + linux/arm64, pushed by goreleaser's
-`dockers_v2` from the release job. Assets in `server/zarf/docker/`: the `Dockerfile`
+`ghcr.io/aether-music-player/aether-server`, linux/amd64 + linux/arm64, pushed by goreleaser's
+`dockers_v2` from the release job. Assets in `zarf/docker/`: the `Dockerfile`
 copies the prebuilt binary from `$TARGETPLATFORM/aether` in goreleaser's build
 context (nothing compiles in the image), and `config.yaml` is the image's
 `/etc/aether/config.yaml`.
@@ -142,30 +140,6 @@ appends to the same release and would upload it twice. It is listed in
   release fails ("globbing failed for pattern webui/dist") instead of
   publishing an empty zip.
 
-## The website
-
-`site/` (Hugo + hugo-book, authoring notes in `site/README.md`) is the public
-landing page and user documentation, at `https://andresbott.github.io/aether/`.
-`.github/workflows/site.yml` builds and deploys it; `release.yml` calls it as
-the `site` job, so the live site tracks the **latest stable release**, not
-`main`: a docs fix on `main` goes live with the next release.
-
-- **It always builds the latest stable tag**, whatever ref it runs on: it
-  checks out the highest `v*.*.*` tag without a `-` suffix before building.
-  So a patch tag on an older release line does not roll the site back, and
-  running the `site` workflow by hand (from any branch) republishes that tag,
-  never `main`. It fails if that tag predates `site/`.
-- **Not triggered by the `release` event**: goreleaser publishes the release
-  with `GITHUB_TOKEN`, and events caused by that token start no workflows.
-  Hence the job inside `release.yml`, `needs: server-linux`.
-- **One-time repository setup** (without it the `site` job fails, after the
-  release itself is already out): Settings → Pages → Source "GitHub Actions";
-  then Settings → Environments → `github-pages` → add a tag rule `v*`. The
-  environment only accepts deployments from the default branch by default, so a
-  tag run is rejected ("Tag … is not allowed to deploy to github-pages").
-- The theme is a Hugo module pinned in `site/go.mod`, which is why the job sets
-  up Go. `site/go.mod` is not part of the server module.
-
 ## Config resolution
 
 `aether start` with no `-c` probes `./config.yaml` then
@@ -178,7 +152,7 @@ working directory cannot shadow the packaged one.
 
 ## Traps
 
-- **The embedded UI is whatever is in `server/app/spa/files/ui` at build time.** A
+- **The embedded UI is whatever is in `app/spa/files/ui` at build time.** A
   local `go build` without a prior `make package-ui` embeds the stale (or
   gitkeep-only) UI. Any release-path change must keep the
   `package-ui → build` ordering.

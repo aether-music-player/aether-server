@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   contact:
     name: Andres Bott
-    url: https://github.com/andresbott/aether
+    url: https://github.com/aether-music-player/aether-server
   description: >
     Internal, admin-only server-management API — libraries (saved filters) and
     the read-only scan-folder list, scanning, tasks/scheduling, and other

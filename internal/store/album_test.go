@@ -1,0 +1,429 @@
+package store_test
+
+import (
+	"errors"
+	"slices"
+	"testing"
+
+	"github.com/aether-music-player/aether-server/internal/model"
+	"github.com/aether-music-player/aether-server/internal/store"
+)
+
+func TestFindOrCreateAlbum(t *testing.T) {
+	s := testStore(t)
+	var album *model.Album
+	ident := store.AlbumIdentity{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead", MBReleaseID: ""}
+	err := s.Transaction(func(tx *store.Store) error {
+		var txErr error
+		album, txErr = tx.FindOrCreateAlbum(ident)
+		return txErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if album.ID == 0 {
+		t.Fatal("expected non-zero ID")
+	}
+	var same *model.Album
+	err = s.Transaction(func(tx *store.Store) error {
+		var txErr error
+		same, txErr = tx.FindOrCreateAlbum(ident)
+		return txErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.ID != album.ID {
+		t.Fatal("expected same album ID")
+	}
+}
+
+func TestFindOrCreateAlbumPropagatesQueryError(t *testing.T) {
+	s := testStore(t)
+	failQueries(t, s)
+
+	ident := store.AlbumIdentity{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead", MBReleaseID: ""}
+	_, err := s.FindOrCreateAlbum(ident)
+	if err == nil {
+		t.Fatal("expected the DB error to propagate, got nil (a real failure was treated as not-found)")
+	}
+	if !errors.Is(err, errQueryBoom) {
+		t.Fatalf("expected the injected DB error, got %v", err)
+	}
+}
+
+func TestGetAlbum(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	artist := model.Artist{Name: "Radiohead", NameNorm: "radiohead"}
+	db.Create(&artist)
+	album := model.Album{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead", Year: 2000}
+	db.Create(&album)
+	_ = db.Model(&album).Association("Artists").Replace([]*model.Artist{&artist})
+	rock := model.Genre{Name: "Rock"}
+	db.Create(&rock)
+	_ = db.Model(&album).Association("Genres").Replace([]*model.Genre{&rock})
+	track := model.Track{AlbumID: album.ID, Filename: "01.mp3", FilePath: "/01.mp3", Title: "Everything", TrackNumber: 1, Duration: 250}
+	db.Create(&track)
+	found, err := s.GetAlbum(album.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.Name != "Kid A" {
+		t.Fatalf("unexpected: %s", found.Name)
+	}
+	if len(found.Tracks) != 1 {
+		t.Fatalf("expected 1 track, got %d", len(found.Tracks))
+	}
+	if len(found.Artists) != 1 {
+		t.Fatalf("expected 1 artist, got %d", len(found.Artists))
+	}
+}
+
+func TestGetAlbumNotFound(t *testing.T) {
+	s := testStore(t)
+	_, err := s.GetAlbum(9999)
+	if err == nil {
+		t.Fatal("expected error for missing album")
+	}
+}
+
+func TestGetAlbumListAlphabetical(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "Zebra", NameNorm: "zebra", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "Alpha", NameNorm: "alpha", AlbumArtistNorm: "x"})
+	albums, err := s.GetAlbumList("alphabeticalByName", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 2 {
+		t.Fatalf("expected 2 albums, got %d", len(albums))
+	}
+	if albums[0].NameNorm != "alpha" {
+		t.Fatalf("expected alpha first, got %s", albums[0].NameNorm)
+	}
+}
+
+func TestGetAlbumListNewest(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "Old", NameNorm: "old", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "New", NameNorm: "new", AlbumArtistNorm: "x"})
+	albums, err := s.GetAlbumList("newest", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 2 {
+		t.Fatalf("expected 2 albums, got %d", len(albums))
+	}
+	if albums[0].Name != "New" {
+		t.Fatalf("expected 'New' first, got %s", albums[0].Name)
+	}
+}
+
+func TestSearchAlbums(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "Kid A", NameNorm: "kid a", AlbumArtistNorm: "radiohead"})
+	db.Create(&model.Album{Name: "OK Computer", NameNorm: "ok computer", AlbumArtistNorm: "radiohead"})
+	results, err := s.SearchAlbums("kid", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestGetAlbumListByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+
+	onlyL1 := model.Album{Name: "Only1", NameNorm: "only1", AlbumArtistNorm: "x"}
+	onlyL2 := model.Album{Name: "Only2", NameNorm: "only2", AlbumArtistNorm: "x"}
+	shared := model.Album{Name: "Shared", NameNorm: "shared", AlbumArtistNorm: "x"}
+	db.Create(&onlyL1)
+	db.Create(&onlyL2)
+	db.Create(&shared)
+
+	db.Create(&model.Track{AlbumID: onlyL1.ID, ScanFolder: "L1", Filename: "a.mp3", FilePath: "/l1/a.mp3"})
+	db.Create(&model.Track{AlbumID: onlyL2.ID, ScanFolder: "L2", Filename: "b.mp3", FilePath: "/l2/b.mp3"})
+	db.Create(&model.Track{AlbumID: shared.ID, ScanFolder: "L1", Filename: "c.mp3", FilePath: "/l1/c.mp3"})
+	db.Create(&model.Track{AlbumID: shared.ID, ScanFolder: "L2", Filename: "d.mp3", FilePath: "/l2/d.mp3"})
+
+	got, err := s.GetAlbumList("alphabeticalByName", 10, 0, &store.AlbumListFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 albums (Only1 + Shared), got %d", len(got))
+	}
+	names := map[string]bool{got[0].Name: true, got[1].Name: true}
+	if !names["Only1"] || !names["Shared"] {
+		t.Fatalf("expected Only1 and Shared, got %v", names)
+	}
+
+	all, err := s.GetAlbumList("alphabeticalByName", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 albums with nil filter, got %d", len(all))
+	}
+}
+
+func TestGetAlbumLetterIndex(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	// alphabeticalByName order: "10 years", "a", "abba", "beta", "zed"
+	db.Create(&model.Album{Name: "Abba", NameNorm: "abba", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "A", NameNorm: "a", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "Beta", NameNorm: "beta", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "10 Years", NameNorm: "10 years", AlbumArtistNorm: "x"})
+	db.Create(&model.Album{Name: "Zed", NameNorm: "zed", AlbumArtistNorm: "x"})
+
+	letters, total, err := s.GetAlbumLetterIndex(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("expected total 5, got %d", total)
+	}
+	got := map[string][2]int{}
+	for _, l := range letters {
+		got[l.Letter] = [2]int{l.Offset, l.Count}
+	}
+	// "#" bucket: "10 years" at offset 0, count 1
+	if got["#"] != [2]int{0, 1} {
+		t.Fatalf("# bucket = %v, want [0 1]", got["#"])
+	}
+	// "A" bucket: "a","abba" at offset 1, count 2
+	if got["A"] != [2]int{1, 2} {
+		t.Fatalf("A bucket = %v, want [1 2]", got["A"])
+	}
+	// "B" bucket: "beta" at offset 3, count 1
+	if got["B"] != [2]int{3, 1} {
+		t.Fatalf("B bucket = %v, want [3 1]", got["B"])
+	}
+	// "Z" bucket: "zed" at offset 4, count 1
+	if got["Z"] != [2]int{4, 1} {
+		t.Fatalf("Z bucket = %v, want [4 1]", got["Z"])
+	}
+}
+
+func TestGetAlbumLetterIndexByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+	a := model.Album{Name: "Apple", NameNorm: "apple", AlbumArtistNorm: "x"}
+	b := model.Album{Name: "Banana", NameNorm: "banana", AlbumArtistNorm: "x"}
+	db.Create(&a)
+	db.Create(&b)
+	db.Create(&model.Track{AlbumID: a.ID, ScanFolder: "L1", Filename: "a.mp3", FilePath: "/l1/a.mp3"})
+	db.Create(&model.Track{AlbumID: b.ID, ScanFolder: "L2", Filename: "b.mp3", FilePath: "/l2/b.mp3"})
+
+	letters, total, err := s.GetAlbumLetterIndex(&store.AlbumListFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("expected total 1 for lib1, got %d", total)
+	}
+	if len(letters) != 1 || letters[0].Letter != "A" {
+		t.Fatalf("expected only A bucket, got %+v", letters)
+	}
+}
+
+func TestAlbumTrackStats(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	a := model.Album{Name: "A", NameNorm: "a", AlbumArtistNorm: "x"}
+	b := model.Album{Name: "B", NameNorm: "b", AlbumArtistNorm: "x"}
+	db.Create(&a)
+	db.Create(&b)
+	db.Create(&model.Track{AlbumID: a.ID, Filename: "1.mp3", FilePath: "/1.mp3", Duration: 100})
+	db.Create(&model.Track{AlbumID: a.ID, Filename: "2.mp3", FilePath: "/2.mp3", Duration: 200})
+
+	stats, err := s.AlbumTrackStats([]uint{a.ID, b.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats[a.ID].Count != 2 || stats[a.ID].Duration != 300 {
+		t.Fatalf("album A stats = %+v, want count 2 duration 300", stats[a.ID])
+	}
+	if _, ok := stats[b.ID]; ok {
+		t.Fatalf("album B has no tracks; should be absent")
+	}
+	empty, err := s.AlbumTrackStats(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected empty map for no ids, got %d", len(empty))
+	}
+}
+
+func TestSearchAlbumsByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+
+	lib1 := model.Library{Name: "L1", Filters: scanFolderFilter("L1")}
+	lib2 := model.Library{Name: "L2", Filters: scanFolderFilter("L2")}
+	db.Create(&lib1)
+	db.Create(&lib2)
+
+	a1 := model.Album{Name: "Blue Album", NameNorm: "blue album", AlbumArtistNorm: "x"}
+	a2 := model.Album{Name: "Blue Planet", NameNorm: "blue planet", AlbumArtistNorm: "x"}
+	db.Create(&a1)
+	db.Create(&a2)
+	db.Create(&model.Track{AlbumID: a1.ID, ScanFolder: "L1", Filename: "1.mp3", FilePath: "/l1/1.mp3"})
+	db.Create(&model.Track{AlbumID: a2.ID, ScanFolder: "L2", Filename: "2.mp3", FilePath: "/l2/2.mp3"})
+
+	got, err := s.SearchAlbums("blue", 10, 0, &store.SearchFilter{Scope: scanFolderScope("L1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "Blue Album" {
+		t.Fatalf("expected only Blue Album, got %+v", got)
+	}
+
+	all, err := s.SearchAlbums("blue", 10, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 albums with nil filter, got %d", len(all))
+	}
+}
+
+func TestGetAlbumListFilterByReleaseType(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "LP", NameNorm: "lp", AlbumArtistNorm: "x", ReleaseTypes: []string{"Album"}})
+	// Lowercase, as a Vorbis file may store it — must still match "Album".
+	db.Create(&model.Album{Name: "Low", NameNorm: "low", AlbumArtistNorm: "x", ReleaseTypes: []string{"album"}})
+	db.Create(&model.Album{Name: "Hit", NameNorm: "hit", AlbumArtistNorm: "x", ReleaseTypes: []string{"Single"}})
+	db.Create(&model.Album{Name: "Untyped", NameNorm: "untyped", AlbumArtistNorm: "x"})
+
+	got, err := s.GetAlbumList("alphabeticalByName", 100, 0, &store.AlbumListFilter{ReleaseType: "Album"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 Album releases (case-insensitive), got %d", len(got))
+	}
+	names := map[string]bool{}
+	for _, a := range got {
+		names[a.NameNorm] = true
+	}
+	if !names["lp"] || !names["low"] {
+		t.Fatalf("expected both lp and low, got %+v", names)
+	}
+}
+
+func TestGetAlbumListReleaseTypeExcludesUntyped(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "S1", NameNorm: "s1", AlbumArtistNorm: "x", ReleaseTypes: []string{"Single"}})
+	db.Create(&model.Album{Name: "Untyped", NameNorm: "untyped", AlbumArtistNorm: "x"})
+
+	got, err := s.GetAlbumList("alphabeticalByName", 100, 0, &store.AlbumListFilter{ReleaseType: "Single"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].NameNorm != "s1" {
+		t.Fatalf("expected only the Single, got %+v", got)
+	}
+	all, err := s.GetAlbumList("alphabeticalByName", 100, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 unfiltered, got %d", len(all))
+	}
+}
+
+// ReleaseTypeCounts groups types the way the releaseType filter matches them
+// (case-insensitively), so each count is exactly what filtering by that type
+// lists. An album carrying one type in two spellings counts once, and blanks,
+// untyped albums and the JSON null a nil slice stores contribute nothing.
+func TestReleaseTypeCounts(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "LP", NameNorm: "lp", AlbumArtistNorm: "x", ReleaseTypes: []string{"Album"}})
+	db.Create(&model.Album{Name: "Low", NameNorm: "low", AlbumArtistNorm: "x", ReleaseTypes: []string{"album", "Live"}})
+	db.Create(&model.Album{Name: "Twice", NameNorm: "twice", AlbumArtistNorm: "x", ReleaseTypes: []string{"EP", "ep"}})
+	db.Create(&model.Album{Name: "Blank", NameNorm: "blank", AlbumArtistNorm: "x", ReleaseTypes: []string{" "}})
+	db.Create(&model.Album{Name: "Empty", NameNorm: "empty", AlbumArtistNorm: "x", ReleaseTypes: []string{}})
+	db.Create(&model.Album{Name: "Untyped", NameNorm: "untyped", AlbumArtistNorm: "x"})
+
+	got, err := s.ReleaseTypeCounts(store.TrackScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []store.ReleaseTypeCount{
+		{Name: "Album", AlbumCount: 2},
+		{Name: "EP", AlbumCount: 1},
+		{Name: "Live", AlbumCount: 1},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// Inside a library only the albums with a track in its scope count, so a type
+// that library holds no release of is not reported at all.
+func TestReleaseTypeCountsByLibrary(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	lp := model.Album{Name: "LP", NameNorm: "lp", AlbumArtistNorm: "x", ReleaseTypes: []string{"Album"}}
+	hit := model.Album{Name: "Hit", NameNorm: "hit", AlbumArtistNorm: "x", ReleaseTypes: []string{"Single"}}
+	db.Create(&lp)
+	db.Create(&hit)
+	db.Create(&model.Track{AlbumID: lp.ID, ScanFolder: "L1", Filename: "a.mp3", FilePath: "/l1/a.mp3"})
+	db.Create(&model.Track{AlbumID: hit.ID, ScanFolder: "L2", Filename: "b.mp3", FilePath: "/l2/b.mp3"})
+
+	got, err := s.ReleaseTypeCounts(scanFolderScope("L1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []store.ReleaseTypeCount{{Name: "Album", AlbumCount: 1}}; !slices.Equal(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	none, err := s.ReleaseTypeCounts(store.NoTracks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("a scope matching nothing reported %+v", none)
+	}
+}
+
+func TestGetAlbumLetterIndexFilterByReleaseType(t *testing.T) {
+	s := testStore(t)
+	db := s.DB()
+	db.Create(&model.Album{Name: "Abba", NameNorm: "abba", AlbumArtistNorm: "x", ReleaseTypes: []string{"EP"}})
+	db.Create(&model.Album{Name: "Beta", NameNorm: "beta", AlbumArtistNorm: "x", ReleaseTypes: []string{"Album"}})
+	db.Create(&model.Album{Name: "Acme", NameNorm: "acme", AlbumArtistNorm: "x", ReleaseTypes: []string{"EP"}})
+
+	letters, total, err := s.GetAlbumLetterIndex(&store.AlbumListFilter{ReleaseType: "EP"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 EPs, got %d", total)
+	}
+	if len(letters) != 1 || letters[0].Letter != "A" || letters[0].Count != 2 {
+		t.Fatalf("expected one 'A' bucket count 2, got %+v", letters)
+	}
+}

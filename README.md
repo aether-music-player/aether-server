@@ -7,8 +7,6 @@ Vue 3 web player embedded.
 > **Pre-release:** under active development.
 > [More details](https://andresbott.github.io/aether/docs/about/pre-release/)
 
-![The library: album grid, play queue and player bar](site/assets/screenshots/library.png)
-
 **Documentation:** <https://andresbott.github.io/aether/>
 
 ## Quick start with Docker
@@ -18,7 +16,7 @@ docker run -d --name aether -p 8075:8075 \
   -e AETHER_AUTH_ADMINBOOTSTRAP_PW='change-me' \
   -v aether-data:/var/lib/aether \
   -v /path/to/music:/music:ro \
-  ghcr.io/andresbott/aether:latest
+  ghcr.io/aether-music-player/aether-server:latest
 ```
 
 Open <http://localhost:8075>, sign in as `admin` with the password above, and

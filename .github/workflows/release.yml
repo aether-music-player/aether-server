@@ -32,7 +32,7 @@ jobs:
         with:
           go-version: '1.25.4'
           cache: true
-          cache-dependency-path: server/go.sum
+          cache-dependency-path: go.sum
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -73,20 +73,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ===========================================================================
-  # Docs site (site/) to GitHub Pages, once the release exists. Skipped for
-  # prereleases (v1.2.3-rc1) so the live site describes the latest stable
-  # release. See site.yml for the one-time Pages setup it needs.
-  # ===========================================================================
-  site:
-    needs: server-linux
-    if: ${{ !contains(github.ref_name, '-') }}
-    uses: ./.github/workflows/site.yml
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-
-  # ===========================================================================
   # macOS (runs on macOS, appends to existing release)
   # ===========================================================================
   server-darwin:
@@ -106,7 +92,7 @@ jobs:
         with:
           go-version: '1.25.4'
           cache: true
-          cache-dependency-path: server/go.sum
+          cache-dependency-path: go.sum
 
       - name: Setup Node.js
         uses: actions/setup-node@v6

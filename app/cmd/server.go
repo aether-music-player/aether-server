@@ -1,0 +1,373 @@
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/aether-music-player/aether-server/app/metainfo"
+	"github.com/aether-music-player/aether-server/app/router"
+	"github.com/aether-music-player/aether-server/app/router/handlers"
+	artistsHandler "github.com/aether-music-player/aether-server/app/router/handlers/artists"
+	"github.com/aether-music-player/aether-server/app/tasks"
+	"github.com/aether-music-player/aether-server/internal/artist"
+	"github.com/aether-music-player/aether-server/internal/artistimage"
+	"github.com/aether-music-player/aether-server/internal/assetstore"
+	"github.com/aether-music-player/aether-server/internal/identify"
+	"github.com/aether-music-player/aether-server/internal/imagecache"
+	"github.com/aether-music-player/aether-server/internal/model"
+	"github.com/aether-music-player/aether-server/internal/scanner"
+	"github.com/aether-music-player/aether-server/internal/store"
+	"github.com/aether-music-player/aether-server/internal/tags"
+	"github.com/aether-music-player/aether-server/internal/taskrunner"
+	"github.com/aether-music-player/aether-server/libs/acoustid"
+	"github.com/aether-music-player/aether-server/libs/fpcalc"
+	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
+	gormlogger "gorm.io/gorm/logger"
+)
+
+func serverCmd() *cobra.Command {
+	var configFile string
+	cmd := &cobra.Command{
+		Use:   "start",
+		Short: "start the aether server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServer(configFile)
+		},
+	}
+	cmd.Flags().StringVarP(&configFile, "config", "c", "",
+		"config file; default: ./config.yaml then /etc/aether/config.yaml")
+	return cmd
+}
+
+func runServer(configFile string) error {
+	path, mandatory := resolveConfigFile(configFile, configSearchPaths)
+	cfg, err := getAppCfg(path, mandatory)
+	if err != nil {
+		return err
+	}
+
+	l, err := defaultLogger(GetLogLevel(cfg.Env.LogLevel))
+	if err != nil {
+		return err
+	}
+
+	l.Info("App startup",
+		slog.String("component", "startup"),
+		slog.String("version", metainfo.Version),
+		slog.String("Build Date", metainfo.BuildTime),
+		slog.String("commit", metainfo.ShaVer),
+	)
+	for _, m := range cfg.Msgs {
+		if m.Level == "info" {
+			l.Info(m.Msg, slog.String("component", "config"))
+		} else {
+			l.Debug(m.Msg, slog.String("component", "config"))
+		}
+	}
+
+	err = initDataDir(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	l.Info("using data directory", slog.String("path", cfg.DataDir))
+
+	gormLog := gormlogger.NewSlogLogger(
+		l.With(slog.String("component", "gorm")),
+		gormlogger.Config{
+			IgnoreRecordNotFoundError: true,
+			LogLevel:                  gormlogger.Warn,
+		},
+	)
+	db, err := openDB(cfg.DataDir, gormLog)
+	if err != nil {
+		return err
+	}
+
+	// Migrate domain models
+	if err := model.Migrate(db); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	dataStore := store.New(db)
+
+	// Scan folders live only in the config file. getAppCfg already validated
+	// them, so this cannot fail on a config typo; it builds the set every
+	// consumer below shares.
+	folders, err := scanFolderSet(cfg.ScanFolders)
+	if err != nil {
+		return err
+	}
+	warnScanFolders(l, dataStore, folders)
+	warnDanglingLibraryFilters(l, dataStore, folders)
+
+	auth, err := setupAuth(db, cfg.DataDir, cfg.Auth, l)
+	if err != nil {
+		return err
+	}
+
+	assets := assetstore.New(filepath.Join(cfg.DataDir, "metadata"))
+	// A second cache handle on the same root the router builds (main.go): both are
+	// stateless directory wrappers, so the prune task and the request handlers can
+	// hold their own without sharing an instance.
+	images := imagecache.New(filepath.Join(cfg.DataDir, router.ImageCacheDir))
+	// The artist-image provider chain (nil when no provider key is set) powers
+	// the manual gallery (List/Download) on the artists handler and the setMBID
+	// auto-fetch (via artist.ImageService). Both are nil together with the chain.
+	artistChain := buildArtistFetcher(cfg.ArtistImages)
+	var artistImages *artist.ImageService
+	var artistFetcher artistsHandler.Fetcher
+	if artistChain != nil {
+		artistImages = artist.NewImageService(assets, artistChain)
+		artistFetcher = artistChain
+	}
+
+	scanCfg := scanner.Config{
+		TagReadWorkers: cfg.TaskRunner.TagReadWorkers,
+		AssetRekeyer:   assets,
+		Folders:        folders,
+	}
+
+	// Task runner
+	logDir := cfg.TaskRunner.LogDir
+	if logDir == "" {
+		logDir = filepath.Join(cfg.DataDir, "task-logs")
+	}
+	runner, err := taskrunner.NewRunner(taskrunner.Cfg{
+		Parallelism: cfg.TaskRunner.Parallelism,
+		QueueSize:   cfg.TaskRunner.QueueSize,
+		HistorySize: cfg.TaskRunner.HistorySize,
+		Logger:      l,
+		DB:          db,
+		LogDir:      logDir,
+		LogLevel:    GetLogLevel(cfg.Env.LogLevel),
+	})
+	if err != nil {
+		return fmt.Errorf("task runner: %w", err)
+	}
+
+	// Tag reader
+	tagReader := tags.NewFallbackReader(tags.TaglibReader{}, tags.FFProbeReader{})
+
+	// Audio identification is optional: it needs the fpcalc binary
+	// (Chromaprint) on the host and an AcoustID application key.
+	// identifyOff is the user-facing reason shown by the metadata editor when
+	// identification is disabled; empty means it is available.
+	acoustIDAppKey := metainfo.AcoustIDAppKey(metainfo.Version)
+	var identifier *identify.Identifier
+	var identifyOff string
+	switch {
+	case acoustIDAppKey == "":
+		identifyOff = "this build has no AcoustID application key, so audio identification is disabled"
+		l.Info("no AcoustID application key for this version — audio identification disabled",
+			slog.String("component", "startup"))
+	case !fpcalc.Available(""):
+		identifyOff = "the fpcalc binary (Chromaprint) was not found on the server at startup; " +
+			"install it (Debian/Ubuntu: libchromaprint-tools) and restart Aether"
+		l.Info("fpcalc binary not found in PATH — audio identification disabled",
+			slog.String("component", "startup"))
+	default:
+		userAgent := fmt.Sprintf("Aether/%s (https://github.com/aether-music-player/aether-server)", metainfo.Version)
+		identifier = identify.New(fpcalc.New(""), acoustid.New(acoustIDAppKey, userAgent))
+		// One cache on the shared identifier, so the per-track and album
+		// endpoints reuse each other's fingerprint pass rather than each paying
+		// an fpcalc run plus a rate-limited AcoustID call per file.
+		identifier.Cache = identify.NewCache(identify.DefaultCacheSize)
+	}
+
+	// Register tasks — the incremental scan and the full scan are independent,
+	// user-triggered tasks. scan and scan-full are separate singleton tasks so
+	// a full run never coalesces onto an in-flight incremental one (the runner
+	// dedupes by task name); both share the library-writes exclusion group, so
+	// they — and the reindex below — never touch the index at once.
+	// Reindex is the metadata editor's targeted re-index, enqueued by its write
+	// handlers rather than run on demand.
+	runner.RegisterWithProgress(tasks.NewScanTaskFn(scanCfg, dataStore, tagReader, false), tasks.ScanTaskName, 1,
+		taskrunner.Singleton(), taskrunner.ExclusionGroup(tasks.LibraryWriteExclusionGroup))
+	runner.RegisterWithProgress(tasks.NewScanTaskFn(scanCfg, dataStore, tagReader, true), tasks.ScanFullTaskName, 1,
+		taskrunner.Singleton(), taskrunner.ExclusionGroup(tasks.LibraryWriteExclusionGroup))
+	taskrunner.Register[tasks.ReindexParams](runner, tasks.NewReindexTaskFn(scanCfg, dataStore, tagReader), tasks.ReindexTaskName, 1,
+		taskrunner.ExclusionGroup(tasks.LibraryWriteExclusionGroup))
+	// Prune orphaned cover derivatives and stored covers. It reads the whole
+	// entity set, so it joins the library-writes exclusion group to never race a
+	// scan/reindex, and is a singleton so overlapping triggers coalesce. Reports
+	// progress per kind, so it registers on the with-progress path like scan.
+	runner.RegisterWithProgress(
+		tasks.NewPruneTaskFn(dataStore, images, assets),
+		tasks.PruneTaskName, 1,
+		taskrunner.Singleton(), taskrunner.ExclusionGroup(tasks.LibraryWriteExclusionGroup),
+	)
+	runner.Start()
+
+	scheduler, err := taskrunner.NewScheduler(taskrunner.SchedulerCfg{
+		DB:       db,
+		Enqueuer: runner,
+		Logger:   l,
+	})
+	if err != nil {
+		return fmt.Errorf("scheduler: %w", err)
+	}
+
+	routerCfg := router.Cfg{
+		Logger:        l,
+		TaskRunner:    runner,
+		TaskLogGetter: runner,
+		Scheduler:     scheduler,
+		Store:         dataStore,
+		DataDir:       cfg.DataDir,
+		ScanFolders:   folders,
+		TagReader:     tagReader,
+		ArtistFetcher: artistFetcher,
+		ArtistImages:  artistImages,
+		AuthMethod:    cfg.Auth.Method,
+		Users:         auth.Users,
+		Passwords:     auth.Passwords,
+		LoginGuard:    auth.LoginGuard,
+		Reauth:        auth.Reauth,
+		Sessions:      auth.Sessions,
+		Tokens:        auth.Tokens,
+		HeaderAuth:    auth.HeaderAuth,
+		AdminGroup:    cfg.Auth.ProxyHeader.AdminGroup,
+		Production:    cfg.Env.Production,
+	}
+	if identifier != nil {
+		routerCfg.Identifier = identifier
+	} else {
+		routerCfg.IdentifyUnavailableReason = identifyOff
+	}
+	mainAppHandler, err := router.New(routerCfg)
+	if err != nil {
+		return fmt.Errorf("unable to initialize main app handler: %v", err)
+	}
+
+	mainSrv := &http.Server{
+		Addr:              cfg.Server.Addr(),
+		Handler:           mainAppHandler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	return serveWithGracefulShutdown(l, cfg.Obs, mainSrv, scheduler, runner)
+}
+
+// serveWithGracefulShutdown runs the main HTTP server (and the optional
+// observability server) until a signal or a server error, then stops the
+// scheduler and drains the task runner within a bounded shutdown window.
+func serveWithGracefulShutdown(l *slog.Logger, obs obsCfg, mainSrv *http.Server, scheduler *taskrunner.Scheduler, runner *taskrunner.Runner) error {
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	if err := scheduler.Start(rootCtx); err != nil {
+		return fmt.Errorf("start scheduler: %w", err)
+	}
+
+	g, gctx := errgroup.WithContext(rootCtx)
+	g.Go(func() error { return serveHTTP(gctx, mainSrv, l, "server") })
+	// The observability server (health, Prometheus metrics) is opt-in.
+	if obs.Enabled {
+		obsSrv := &http.Server{
+			Addr:              obs.Addr(),
+			Handler:           handlers.Admin(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		g.Go(func() error { return serveHTTP(gctx, obsSrv, l, "observability") })
+	} else {
+		l.Info("observability server disabled", slog.String("component", "observability"))
+	}
+	g.Go(func() error {
+		<-gctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := scheduler.Stop(shutdownCtx); err != nil {
+			l.Error("scheduler shutdown", slog.String("component", "taskrunner"), slog.String("error", err.Error()))
+		}
+		return runner.Shutdown(shutdownCtx)
+	})
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		rootCancel()
+	}()
+
+	return g.Wait()
+}
+
+// buildArtistFetcher assembles the artist-image provider chain from whatever
+// provider API keys are set. If none are configured it returns nil; callers
+// then leave the dependent handler/service/task features off (the task is
+// always registered and reports a clear "not configured" message when run).
+func buildArtistFetcher(cfg ArtistImagesCfg) *artistimage.Chain {
+	var providers []artistimage.Provider
+	if cfg.FanartApiKey != "" {
+		providers = append(providers, artistimage.NewFanartTV(cfg.FanartApiKey))
+	}
+	if cfg.TheAudioDBApiKey != "" {
+		providers = append(providers, artistimage.NewTheAudioDB(cfg.TheAudioDBApiKey))
+	}
+	if len(providers) == 0 {
+		return nil
+	}
+	return artistimage.NewChain(providers...)
+}
+
+func serveHTTP(ctx context.Context, srv *http.Server, l *slog.Logger, component string) error {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return fmt.Errorf("%s listen: %w", component, err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	l.Info(component+" server started", slog.String("component", component), slog.String("addr", srv.Addr))
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Shutdown drains idle connections but only *waits* for in-flight handlers —
+	// it never cancels their request context, so a handler doing slow work (an
+	// upstream lookup retrying with a 20s client timeout, a tag read shelling out
+	// to ffprobe) runs to completion regardless. Without the Close below, the
+	// expired grace period is merely logged and the <-serveErr wait right after
+	// keeps blocking on that same handler. Close drops the underlying connections,
+	// which is what actually cancels the request context and lets the process go.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		l.Warn(component+" server shutdown error, closing remaining connections",
+			slog.String("component", component), slog.String("error", err.Error()))
+		if cerr := srv.Close(); cerr != nil {
+			l.Warn(component+" server close error", slog.String("component", component), slog.String("error", cerr.Error()))
+		}
+	}
+	l.Info(component+" server stopped", slog.String("component", component))
+	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func initDataDir(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(absPath, 0750); err != nil {
+			return fmt.Errorf("failed to create directory: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to stat path: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", absPath)
+	}
+
+	return nil
+}

@@ -1,0 +1,322 @@
+// internal/scanner/reconcile_test.go
+package scanner_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/aether-music-player/aether-server/internal/model"
+	"github.com/aether-music-player/aether-server/internal/scanner"
+	"github.com/aether-music-player/aether-server/internal/tags"
+)
+
+func TestReconcileRepointsCoverPathToANewFolderImage(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{
+		"Artist/Album/01.mp3",
+		"Artist/Album/cover.jpg",
+	})
+	folder := seedFolder(dir, nil)
+
+	s := newScanner(t, st, fakeTagReader{}, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	var album model.Album
+	if err := st.DB().First(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	if album.CoverPath != filepath.Join(dir, "Artist/Album/cover.jpg") {
+		t.Fatalf("unexpected initial cover path: %q", album.CoverPath)
+	}
+
+	// The editor replaces cover.jpg with cover.png (WriteFolderPicture removes
+	// the sibling variant), so the stored path now points at a missing file.
+	if err := os.Remove(filepath.Join(dir, "Artist/Album/cover.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	createTestFiles(t, dir, []string{"Artist/Album/cover.png"})
+
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().First(&album, album.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if album.CoverPath != filepath.Join(dir, "Artist/Album/cover.png") {
+		t.Fatalf("expected the cover path to be repointed, got %q", album.CoverPath)
+	}
+}
+
+func TestReconcileClearsAVanishedCoverPath(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{
+		"Artist/Album/01.mp3",
+		"Artist/Album/cover.jpg",
+	})
+	folder := seedFolder(dir, nil)
+
+	s := newScanner(t, st, fakeTagReader{}, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "Artist/Album/cover.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	var album model.Album
+	if err := st.DB().First(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	if album.CoverPath != "" {
+		t.Fatalf("expected the stale cover path to be cleared, got %q", album.CoverPath)
+	}
+}
+
+// A folder that already carries a usable folder.jpg must still switch to a
+// higher-ranked cover.jpg when one appears — the editor writes cover.<ext>, and
+// nothing else repoints CoverPath now that the editor no longer touches the DB.
+func TestReconcileRepointsToAHigherRankedCover(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{
+		"Artist/Album/01.mp3",
+		"Artist/Album/folder.jpg",
+	})
+	folder := seedFolder(dir, nil)
+
+	s := newScanner(t, st, fakeTagReader{}, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	var album model.Album
+	if err := st.DB().First(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	if album.CoverPath != filepath.Join(dir, "Artist/Album/folder.jpg") {
+		t.Fatalf("unexpected initial cover path: %q", album.CoverPath)
+	}
+
+	// folder.jpg stays in place and is still a perfectly usable cover, so the
+	// old "only re-detect an unusable path" rule would keep serving it.
+	createTestFiles(t, dir, []string{"Artist/Album/cover.jpg"})
+
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().First(&album, album.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if album.CoverPath != filepath.Join(dir, "Artist/Album/cover.jpg") {
+		t.Fatalf("expected the cover path to repoint to cover.jpg, got %q", album.CoverPath)
+	}
+}
+
+// Regression test: directory names are data, never glob syntax. Cover detection
+// used to list the directory with filepath.Glob, which reads the whole path as a
+// pattern — "[2020]" is a character class, "\" an escape, an unclosed "[" a bad
+// pattern — so every album under such a folder lost its cover.
+func TestReconcileFindsCoverUnderGlobMetacharacters(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  string
+	}{
+		{
+			name:  "brackets in the album folder",
+			files: []string{"Artist/Album [2020]/01.mp3", "Artist/Album [2020]/cover.jpg"},
+			want:  "Artist/Album [2020]/cover.jpg",
+		},
+		{
+			name:  "brackets in a parent folder",
+			files: []string{"[Compilations]/Album/01.mp3", "[Compilations]/Album/cover.jpg"},
+			want:  "[Compilations]/Album/cover.jpg",
+		},
+		{
+			name:  "unclosed bracket",
+			files: []string{"Artist/Album [Live/01.mp3", "Artist/Album [Live/cover.jpg"},
+			want:  "Artist/Album [Live/cover.jpg",
+		},
+		{
+			name:  "backslash",
+			files: []string{`Artist/AC\DC/01.mp3`, `Artist/AC\DC/cover.jpg`},
+			want:  `Artist/AC\DC/cover.jpg`,
+		},
+		{
+			// The class matched the sibling "Album 1" instead, and its cover.jpg
+			// was recorded under this folder, where no such file exists.
+			name:  "brackets matching a sibling folder",
+			files: []string{"Artist/Album [12]/01.mp3", "Artist/Album [12]/front.jpg", "Artist/Album 1/cover.jpg"},
+			want:  "Artist/Album [12]/front.jpg",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testScanStore(t)
+			dir := t.TempDir()
+			createTestFiles(t, dir, tc.files)
+
+			s := newScanner(t, st, fakeTagReader{}, seedFolder(dir, nil))
+			if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+				t.Fatal(err)
+			}
+
+			var album model.Album
+			if err := st.DB().First(&album).Error; err != nil {
+				t.Fatal(err)
+			}
+			if want := filepath.Join(dir, tc.want); album.CoverPath != want {
+				t.Fatalf("CoverPath = %q, want %q", album.CoverPath, want)
+			}
+		})
+	}
+}
+
+// Regression test: a multi-disc album spanning several directories must not
+// lose its cover when a disc folder with no art reconciles. Albums are keyed
+// on (name, albumArtist, mbReleaseID), not on directory, so "Album/CD 1/"
+// holding cover.jpg and "Album/CD 2/" holding no art collapse to one album row.
+// Whichever disc reconciles last must not blank the other's find.
+func TestReconcilePreservesCoverAcrossMultiDiscAlbum(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{
+		"Artist/Album/CD 1/01.mp3",
+		"Artist/Album/CD 1/cover.jpg",
+		"Artist/Album/CD 2/01.mp3",
+	})
+	folder := seedFolder(dir, nil)
+
+	// Need a custom tag reader that returns the SAME album name for both discs,
+	// so they collapse into one album row.
+	albumName := "Multi Disc Album"
+	reader := customAlbumTagReader{albumName: albumName}
+
+	s := newScanner(t, st, reader, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be exactly one album row despite two directories.
+	var albumCount int64
+	if err := st.DB().Model(&model.Album{}).Count(&albumCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if albumCount != 1 {
+		t.Fatalf("expected 1 album (multi-disc), got %d", albumCount)
+	}
+
+	var album model.Album
+	if err := st.DB().First(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(dir, "Artist/Album/CD 1/cover.jpg")
+	if album.CoverPath != want {
+		t.Fatalf("expected CoverPath = %q, got %q (blanked by art-less sibling folder)", want, album.CoverPath)
+	}
+}
+
+// customAlbumTagReader always returns the given album name regardless of directory.
+type customAlbumTagReader struct {
+	albumName string
+}
+
+func (r customAlbumTagReader) CanRead(absPath string) bool {
+	return scanner.IsAudioFile(absPath)
+}
+
+func (r customAlbumTagReader) Read(_ context.Context, absPath string) (tags.Metadata, error) {
+	return tags.Metadata{
+		Title:       filepath.Base(absPath),
+		Artist:      []string{"Test Artist"},
+		AlbumArtist: []string{"Test Artist"},
+		Album:       r.albumName,
+		Genre:       []string{"Rock"},
+		Year:        2020,
+		TrackNumber: 1,
+		Duration:    180,
+		Bitrate:     320,
+	}, nil
+}
+
+// The size a track row stores must be the size the walk recorded, because
+// planTrackContinuity matches a moved file against the stored value.
+func TestReconcileStoresTheWalkedFileSize(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{"Artist/Album/01.mp3"}) // createTestFiles writes "fake"
+	folder := seedFolder(dir, nil)
+
+	s := newScanner(t, st, fakeTagReader{}, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	var track model.Track
+	if err := st.DB().First(&track).Error; err != nil {
+		t.Fatal(err)
+	}
+	if track.FileSize != 4 {
+		t.Fatalf("FileSize = %d, want 4", track.FileSize)
+	}
+}
+
+// releaseTypeTagReader emits a fixed MusicBrainz release-type list (and the
+// iTunes compilation flag) for every file, so a scan's persistence of the whole
+// list can be asserted end to end.
+type releaseTypeTagReader struct {
+	releaseTypes []string
+	compilation  bool
+}
+
+func (r releaseTypeTagReader) CanRead(absPath string) bool {
+	return scanner.IsAudioFile(absPath)
+}
+
+func (r releaseTypeTagReader) Read(_ context.Context, absPath string) (tags.Metadata, error) {
+	return tags.Metadata{
+		Title:        filepath.Base(absPath),
+		Artist:       []string{"Test Artist"},
+		AlbumArtist:  []string{"Test Artist"},
+		Album:        filepath.Base(filepath.Dir(absPath)),
+		Year:         2020,
+		TrackNumber:  1,
+		Duration:     180,
+		Bitrate:      320,
+		ReleaseTypes: r.releaseTypes,
+		Compilation:  r.compilation,
+	}, nil
+}
+
+// A scanned album must persist the full MusicBrainz release-type list through
+// the serializer:json column, not just the primary type.
+func TestReconcileStoresReleaseTypes(t *testing.T) {
+	st := testScanStore(t)
+	dir := t.TempDir()
+	createTestFiles(t, dir, []string{"Artist/Album/01.mp3"})
+	folder := seedFolder(dir, nil)
+
+	reader := releaseTypeTagReader{releaseTypes: []string{"Album", "Compilation"}}
+	s := newScanner(t, st, reader, folder)
+	if _, err := s.Scan(context.Background(), scanner.ScanOptions{IsFull: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	var album model.Album
+	if err := st.DB().First(&album).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(album.ReleaseTypes) != 2 || album.ReleaseTypes[0] != "Album" || album.ReleaseTypes[1] != "Compilation" {
+		t.Fatalf("ReleaseTypes = %v, want [Album Compilation]", album.ReleaseTypes)
+	}
+}

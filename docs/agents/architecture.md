@@ -1,6 +1,6 @@
 # Architecture — layering, package roles, design decisions
 
-Aether (module `github.com/andresbott/aether`) is a self-hosted **music server**:
+Aether (module `github.com/aether-music-player/aether-server`) is a self-hosted **music server**:
 a single Go binary with an embedded Vue 3 SPA, SQLite persistence, an
 OpenSubsonic-compatible `/rest` API for all music functionality, and a private
 `/api/v0` API for server administration. It is pre-release software with **no
@@ -18,9 +18,9 @@ Read next, per area: [subsonic-api.md](subsonic-api.md) ·
 
 ## Layering
 
-The Go module is `server/`; the package paths below and throughout these docs
-(`app/…`, `internal/…`, `libs/…`, `zarf/…`) are relative to it. The SPA is
-`webui/` at the repo root.
+The Go module is the repo root (`app/…`, `internal/…`, `libs/…`, `zarf/…`);
+the SPA is `webui/` beside it, excluded from `./...` by the `ignore` directive
+in `go.mod`.
 
     app/cmd (cobra CLI, config, wiring)          webui/ (Vue 3 SPA)
             |                                        | (built + embedded)
@@ -93,7 +93,7 @@ build the Go binary embeds, shipped with each server release as
   reaches Rust, only through `webui/src/lib/host/` (see
   [frontend.md](frontend.md#desktop-app-mode-libhost)). Moving playback onto
   IPC is the open follow-up (tracked in the player repo); do not wire it ad hoc.
-- **It never imports from `server/`**, and the server knows nothing about it.
+- **It never imports Go code from this repo**, and the server knows nothing about it.
   The only contract between the two is the OpenSubsonic API — the player is
   just another `/rest` client, so whatever it needs from the server goes
   through the extension route below like any other client's need.
@@ -379,7 +379,7 @@ above).
 - **radio-browser.info** (`internal/radiobrowser`) — station search proxied
   server-side to dodge CORS; an admin import tool only.
 
-All outbound clients send the `Aether/<version> (github.com/andresbott/aether)`
+All outbound clients send the `Aether/<version> (github.com/aether-music-player/aether-server)`
 user agent — keep that convention for new clients.
 
 ### `go-bumbu/http`'s `outbound` — the shared outbound HTTP policy

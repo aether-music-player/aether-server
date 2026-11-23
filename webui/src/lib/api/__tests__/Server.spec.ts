@@ -31,7 +31,7 @@ const meNative: MeResponse = {
 }
 
 // What Aether answers a ping without credentials: HTTP 200, error 40, and its
-// name as the envelope's type (server/app/router/handlers/subsonic/response.go).
+// name as the envelope's type (app/router/handlers/subsonic/response.go).
 const pingEnvelope = {
     'subsonic-response': {
         status: 'failed',

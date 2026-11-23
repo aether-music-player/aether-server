@@ -92,7 +92,7 @@ describe('AboutView', () => {
         const hrefs = mountView()
             .findAll('a')
             .map((a) => a.attributes('href'))
-        expect(hrefs).toContain('https://github.com/andresbott/aether')
+        expect(hrefs).toContain('https://github.com/aether-music-player/aether-server')
     })
 
     it('notes that shortcuts need a keyboard on touch devices', () => {

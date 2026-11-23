@@ -1,0 +1,332 @@
+package tasks
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	apptasks "github.com/aether-music-player/aether-server/app/tasks"
+	"github.com/aether-music-player/aether-server/internal/taskrunner"
+	"github.com/go-bumbu/http/problemjson"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+)
+
+type Handler struct {
+	Runner        *taskrunner.Runner
+	TaskLogGetter taskrunner.TaskLogGetter
+	Schedules     *taskrunner.Scheduler
+	Logger        *slog.Logger
+	// Problems writes this handler's application/problem+json error responses.
+	Problems *problemjson.Writer
+}
+
+// TaskWithSchedule is a task definition combined with every schedule
+// configured for it (possibly none).
+type TaskWithSchedule struct {
+	apptasks.TaskDef
+	Schedules []taskrunner.Schedule `json:"schedules"`
+}
+
+func taskDefByName(name string) (apptasks.TaskDef, bool) {
+	for _, t := range apptasks.AvailableTasks {
+		if t.ID == name {
+			return t, true
+		}
+	}
+	return apptasks.TaskDef{}, false
+}
+
+func (h *Handler) ListTasks() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		out := make([]TaskWithSchedule, 0, len(apptasks.AvailableTasks))
+		var scheduleMap map[string][]taskrunner.Schedule
+		if h.Schedules != nil {
+			list, err := h.Schedules.List(r.Context())
+			if err != nil {
+				h.Logger.Error("list tasks: schedule list failed", "err", err)
+				h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to list tasks.")
+				return
+			}
+			scheduleMap = make(map[string][]taskrunner.Schedule, len(list))
+			for _, s := range list {
+				scheduleMap[s.TaskName] = append(scheduleMap[s.TaskName], s)
+			}
+		}
+		for _, t := range apptasks.AvailableTasks {
+			ent := TaskWithSchedule{TaskDef: t, Schedules: []taskrunner.Schedule{}}
+			if scheds, ok := scheduleMap[t.ID]; ok {
+				ent.Schedules = scheds
+			}
+			out = append(out, ent)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string][]TaskWithSchedule{"tasks": out})
+	})
+}
+
+func (h *Handler) GetTask() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := mux.Vars(r)["name"]
+		def, ok := taskDefByName(name)
+		if !ok {
+			h.Problems.Write(w, r, http.StatusNotFound, "not_found", "unknown task: "+name)
+			return
+		}
+		out := TaskWithSchedule{TaskDef: def, Schedules: []taskrunner.Schedule{}}
+		if h.Schedules != nil {
+			scheds, err := h.Schedules.ListByTaskName(r.Context(), name)
+			if err != nil {
+				h.Logger.Error("get task: schedule list failed", "task", name, "err", err)
+				h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to load the task.")
+				return
+			}
+			out.Schedules = scheds
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+}
+
+// TriggerTaskResult is the 202 body of TriggerTask. Reused is true when the
+// trigger coalesced onto an already waiting/running instance of a singleton
+// task (e.g. scan): ExecutionID then points at that in-flight run and nothing
+// new was enqueued.
+type TriggerTaskResult struct {
+	ExecutionID string `json:"execution_id"`
+	Reused      bool   `json:"reused"`
+}
+
+func (h *Handler) TriggerTask() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := mux.Vars(r)["name"]
+		if !apptasks.TaskNameExists(name) {
+			h.Problems.Write(w, r, http.StatusNotFound, "not_found", "unknown task: "+name)
+			return
+		}
+		// The user-triggerable tasks (scan, scan-full, the artist-image fetch)
+		// take no parameters — the run mode is the task identity — so the trigger
+		// enqueues by name and ignores any request body.
+		id, reused, err := h.Runner.AddRun(name)
+		if err != nil {
+			if errors.Is(err, taskrunner.ErrQueueFull) {
+				h.Problems.Write(w, r, http.StatusTooManyRequests, "queue_full", "Task queue is full. Try again later.")
+				return
+			}
+			h.Logger.Error("trigger task: add run failed", "task", name, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to trigger the task.")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(TriggerTaskResult{ExecutionID: id.String(), Reused: reused})
+	})
+}
+
+func (h *Handler) ListExecutions() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		executions := h.Runner.Executions(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string][]taskrunner.ExecutionInfo{"executions": executions})
+	})
+}
+
+func (h *Handler) CancelExecution() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(mux.Vars(r)["id"])
+		if err != nil {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid execution id")
+			return
+		}
+		if err := h.Runner.Cancel(r.Context(), id); err != nil {
+			// Cancel folds "unknown execution id" and any other cancellation
+			// failure into the same conflict — a documented quirk this refactor
+			// preserves as-is (see cancelTaskExecution's description in
+			// docs/openapi/aether-v0.yaml).
+			h.Logger.Error("cancel execution failed", "id", id.String(), "err", err)
+			h.Problems.Write(w, r, http.StatusConflict, "conflict", "Failed to cancel the execution.")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+func (h *Handler) GetExecutionLog() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.TaskLogGetter == nil {
+			h.Problems.Write(w, r, http.StatusServiceUnavailable, "unavailable", "task logs not available")
+			return
+		}
+		id, err := uuid.Parse(mux.Vars(r)["id"])
+		if err != nil {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid execution id")
+			return
+		}
+		text, err := h.TaskLogGetter.GetTaskLog(r.Context(), id)
+		if err != nil {
+			h.Logger.Error("get execution log failed", "id", id.String(), "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to retrieve the task log.")
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		_, _ = w.Write([]byte(text)) //nolint:gosec // text/plain with nosniff; cannot execute as script
+	})
+}
+
+type CreateScheduleRequest struct {
+	CronExpression string          `json:"cron_expression"`
+	Enabled        *bool           `json:"enabled"`
+	Params         json.RawMessage `json:"params"`
+}
+
+func (h *Handler) CreateSchedule() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.Schedules == nil {
+			h.Problems.Write(w, r, http.StatusServiceUnavailable, "unavailable", "schedules not available")
+			return
+		}
+		name := mux.Vars(r)["name"]
+		if !apptasks.TaskNameExists(name) {
+			h.Problems.Write(w, r, http.StatusNotFound, "not_found", "unknown task: "+name)
+			return
+		}
+		var body CreateScheduleRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid JSON: "+err.Error())
+			return
+		}
+		// An explicit `{"params":null}` decodes to the 4 bytes "null"; treat it as
+		// an omitted params field (nil) exactly as PatchSchedule does, so a created
+		// schedule never round-trips a bare `null` for its params object.
+		if bytes.Equal(bytes.TrimSpace(body.Params), []byte("null")) {
+			body.Params = nil
+		}
+		if body.CronExpression == "" {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "cron_expression required")
+			return
+		}
+		cronExpr := taskrunner.NormalizeCronExpression(body.CronExpression)
+		if err := taskrunner.ValidateCronExpression(cronExpr); err != nil {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid cron_expression: "+err.Error())
+			return
+		}
+		enabled := true
+		if body.Enabled != nil {
+			enabled = *body.Enabled
+		}
+		sch, err := h.Schedules.Create(r.Context(), name, cronExpr, enabled, body.Params)
+		if err != nil {
+			h.Logger.Error("create task schedule failed", "task", name, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to save the task schedule.")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(sch)
+	})
+}
+
+type PatchScheduleRequest struct {
+	CronExpression *string         `json:"cron_expression"`
+	Enabled        *bool           `json:"enabled"`
+	Params         json.RawMessage `json:"params"`
+}
+
+func (h *Handler) PatchSchedule() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.Schedules == nil {
+			h.Problems.Write(w, r, http.StatusServiceUnavailable, "unavailable", "schedules not available")
+			return
+		}
+		name := mux.Vars(r)["name"]
+		id := mux.Vars(r)["id"]
+		existing, err := h.Schedules.Get(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, taskrunner.ErrScheduleNotFound) {
+				h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found: "+id)
+				return
+			}
+			h.Logger.Error("patch schedule: load failed", "id", id, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to load the schedule.")
+			return
+		}
+		// The schedule is addressed under its task (/tasks/{name}/schedules/{id});
+		// a mismatched {name} must not edit another task's schedule.
+		if existing.TaskName != name {
+			h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found under task "+name+": "+id)
+			return
+		}
+		var body PatchScheduleRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid JSON: "+err.Error())
+			return
+		}
+		// An explicit JSON null (`{"params":null}`) decodes to the 4 bytes
+		// "null", which is non-nil — treat it the same as an omitted field
+		// (Update's contract: nil params means "keep the current value").
+		if bytes.Equal(bytes.TrimSpace(body.Params), []byte("null")) {
+			body.Params = nil
+		}
+		var cronPtr *string
+		if body.CronExpression != nil {
+			cronExpr := taskrunner.NormalizeCronExpression(*body.CronExpression)
+			if err := taskrunner.ValidateCronExpression(cronExpr); err != nil {
+				h.Problems.Write(w, r, http.StatusBadRequest, "validation_error", "invalid cron_expression: "+err.Error())
+				return
+			}
+			cronPtr = &cronExpr
+		}
+		sch, err := h.Schedules.Update(r.Context(), id, cronPtr, body.Enabled, body.Params)
+		if err != nil {
+			if errors.Is(err, taskrunner.ErrScheduleNotFound) {
+				h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found: "+id)
+				return
+			}
+			h.Logger.Error("patch schedule failed", "id", id, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to update the schedule.")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sch)
+	})
+}
+
+func (h *Handler) DeleteSchedule() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.Schedules == nil {
+			h.Problems.Write(w, r, http.StatusServiceUnavailable, "unavailable", "schedules not available")
+			return
+		}
+		name := mux.Vars(r)["name"]
+		id := mux.Vars(r)["id"]
+		existing, err := h.Schedules.Get(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, taskrunner.ErrScheduleNotFound) {
+				h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found: "+id)
+				return
+			}
+			h.Logger.Error("delete schedule: load failed", "id", id, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to load the schedule.")
+			return
+		}
+		// Addressed under its task; a mismatched {name} must not delete another
+		// task's schedule.
+		if existing.TaskName != name {
+			h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found under task "+name+": "+id)
+			return
+		}
+		if err := h.Schedules.Delete(r.Context(), id); err != nil {
+			if errors.Is(err, taskrunner.ErrScheduleNotFound) {
+				h.Problems.Write(w, r, http.StatusNotFound, "not_found", "schedule not found: "+id)
+				return
+			}
+			h.Logger.Error("delete schedule failed", "id", id, "err", err)
+			h.Problems.Write(w, r, http.StatusInternalServerError, "internal", "Failed to delete the schedule.")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}

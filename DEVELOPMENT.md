@@ -1,9 +1,9 @@
 # Developing Aether
 
-The Go server lives in `server/`, the Vue SPA in `webui/` and the website
-(landing page + user docs) in `site/`. Internal docs, including the
-contributor notes on each subsystem, are in `docs/agents/`. The desktop
-player (Tauri 2, Rust) lives in its own repo and opens the SPA built here.
+The Go server is the repo root and the Vue SPA lives in `webui/`. Internal docs,
+including the contributor notes on each subsystem, are in `docs/agents/`. The
+desktop player (Tauri 2, Rust) lives in its own repo and opens the SPA built
+here.
 
 ## Make targets
 
@@ -15,11 +15,9 @@ make test     # run the go tests
 make lint     # run golangci-lint
 make verify   # full suite (test, lint, license, benchmark, coverage, ui tests, spec lint)
 make build    # snapshot binary via goreleaser
-make site-serve  # the website in site/ (Hugo), http://localhost:1313/aether/
 ```
 
-The Go targets live in `server/Makefile` and the root ones delegate to it;
-`cd server && make verify` runs the Go checks alone.
+`make go-verify` runs the Go checks alone.
 
 ## Backend and frontend separately
 
@@ -32,15 +30,10 @@ cd webui && npm run dev   # Vite dev server, hot reload
 Open the URL Vite prints; it proxies `/api` and `/rest` to the backend.
 `make run-ui` serves the SPA embedded from `:8075`.
 
-`make run` uses the dev config `server/zarf/localdata/config.yaml`, the full
-annotated example of every setting. It scans `server/zarf/locallibrary`
+`make run` uses the dev config `zarf/localdata/config.yaml`, the full
+annotated example of every setting. It scans `zarf/locallibrary`
 (git-ignored); `make sample-library` fills it with ~1 GB of freely licensed
 albums from the Internet Archive.
-
-## Website
-
-See [`site/README.md`](site/README.md) for running, writing and updating the
-site. It is published to GitHub Pages with every stable release.
 
 ## Release
 

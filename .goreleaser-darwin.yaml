@@ -4,8 +4,6 @@ builds:
   # macOS build
   # =====================================================================================
   - id: darwin
-    # The Go module lives in server/.
-    dir: server
     goos:
       - darwin
     goarch:
@@ -18,9 +16,9 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/andresbott/aether/app/metainfo.Version={{.Version}}
-      - -X github.com/andresbott/aether/app/metainfo.BuildTime={{.Date}}
-      - -X github.com/andresbott/aether/app/metainfo.ShaVer={{.Commit}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.Version={{.Version}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.BuildTime={{.Date}}
+      - -X github.com/aether-music-player/aether-server/app/metainfo.ShaVer={{.Commit}}
     binary: aether
     # Pure Go — see .goreleaser.yaml for why CGO is not needed.
     env:

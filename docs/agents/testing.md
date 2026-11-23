@@ -1,18 +1,17 @@
 # Testing — gates, commands, conventions
 
 The full gate is `make verify` from the repo root — run it before calling any
-work done. It runs the server gate (`make -C server verify`: `test` →
+work done. It runs the Go gate (`make go-verify`: `test` →
 `license-check` → `lint` → `benchmark` → `coverage`), then `ui-test` →
 `spec-lint`, collects all failures, and fails
 if any target failed. CI runs the same pieces, one workflow per component in
 `.github/workflows/`, each on pushes to `main` and on pull requests, so a check
 reads `<component> / <job>` on a PR: `server.yml` (`test` = `make test` +
 `make coverage`, `lint` = golangci-lint, `license-check`, `spec-lint`),
-and `webui.yml` (`test` = `make ui-test` + `make package-ui`). `release.yml` and `site.yml` are the tag-time workflows.
+and `webui.yml` (`test` = `make ui-test` + `make package-ui`). `release.yml` is the tag-time workflow.
 
-The Go targets live in `server/Makefile` (run them there, e.g.
-`cd server && make verify` for a Go-only gate); the root `Makefile` delegates
-to it, so every target below also works from the repo root.
+The Go module is the repo root, so every target below runs from there;
+`make go-verify` is the Go-only gate.
 
 | Target | What it runs |
 |---|---|
@@ -21,14 +20,14 @@ to it, so every target below also works from the repo root.
 | `make lint` | `golangci-lint run` (v2 config; CI pins v2.12.2 to avoid gosec ruleset skew) |
 | `make coverage` | **per-package** total over `./internal/...`, threshold **70%** each |
 | `make benchmark` | `go test -bench=. ./...` |
-| `make license-check` | `go-licence-detector` against `server/allowedLicenses.json` / `server/overrideLicenses.json` |
+| `make license-check` | `go-licence-detector` against `allowedLicenses.json` / `overrideLicenses.json` |
 | `make spec-lint` | Spectral over `docs/openapi/aether-v0.yaml` (root only) |
-| `make verify` | all of the above; the definition of done (in `server/`: the Go checks only) |
+| `make verify` | all of the above; the definition of done (`make go-verify`: the Go checks only) |
 
 - The coverage gate is per `internal/` package, not a repo total. A new
   `internal/` package below 70% fails `verify` — write the tests, don't lower
   `COVERAGE_THRESHOLD`. `app/`, `libs/`, and `webui` are outside this gate.
-- Lint policy (`server/.golangci.yaml`): standard set + `nolintlint`, `gocyclo`
+- Lint policy (`.golangci.yaml`): standard set + `nolintlint`, `gocyclo`
   (min-complexity 20), `nestif`, `gosec`, `dupl`. `nolint` directives must
   name the linter and carry an explanation (`require-explanation: true`).
   The gosec path-traversal suppressions for the media handlers are documented
@@ -73,17 +72,17 @@ to it, so every target below also works from the repo root.
 ## Running the app locally
 
 - `make run` — Go server with debug logging (`AETHER_ENV_LOGLEVEL=debug`),
-  started from `server/` with the dev config `server/zarf/localdata/config.yaml`:
-  data in `server/zarf/localdata/data`, scans `server/zarf/locallibrary` (both
-  git-ignored), provider keys from `server/*.api.key`; serves whatever UI build
+  started from the repo root with the dev config `zarf/localdata/config.yaml`:
+  data in `zarf/localdata/data`, scans `zarf/locallibrary` (both
+  git-ignored), provider keys from `*.api.key`; serves whatever UI build
   is currently embedded.
 - `make sample-library` — downloads ~1 GB of CC / Live Music Archive albums
-  from archive.org into `server/zarf/locallibrary/sample-library` (script and
-  album list: `server/zarf/samplelibrary/fetch.sh`, each entry noting the
+  from archive.org into `zarf/locallibrary/sample-library` (script and
+  album list: `zarf/samplelibrary/fetch.sh`, each entry noting the
   edge case it covers: FLAC vs MP3, embedded vs folder art, composer tags,
   a various-artists compilation, untagged files). No release-type or
   MusicBrainz tags — tag with Picard to exercise those.
-- `make run-ui` — rebuilds the SPA, copies it into `server/app/spa/files/ui`,
+- `make run-ui` — rebuilds the SPA, copies it into `app/spa/files/ui`,
   then runs the server.
 - `cd webui && npm run dev` — Vite dev server for UI work (set
   `VITE_SERVER_URL_V0` if not proxying).
